@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import crypto from "node:crypto";
 import chalk from "chalk";
 import {
   ChatSession,
@@ -10,8 +11,26 @@ import {
 import { ConsiliumClient } from "../api/client";
 import { ContextManager } from "./context-manager";
 import { generateId } from "./id";
+import {
+  type SessionSnapshot,
+  deleteSnapshotFile,
+  formatAutoLabel,
+  listSnapshotFiles,
+  readSnapshot,
+  writeSnapshot,
+} from "./snapshot-store";
 
 const SESSION_DIR = path.join(os.homedir(), ".consilium", "sessions");
+
+export const DEFAULT_SESSION_DIR = SESSION_DIR;
+
+const MAX_SNAPSHOTS_PER_SESSION = 50;
+
+export type SessionData = ChatSessionData & {
+  forkedFrom?: string;
+};
+
+export type { SessionSnapshot } from "./snapshot-store";
 
 export interface SessionMetadata {
   id: string;
@@ -268,4 +287,129 @@ export class SessionManager {
     if (diffDay < 30) return `${diffDay}d ago`;
     return new Date(isoDate).toLocaleDateString();
   }
+
+  snapshotSession(sessionId: string, label?: string): SessionSnapshot {
+    const data = this.readSessionData(sessionId);
+    if (!data) {
+      throw new Error(`Session not found: ${sessionId}`);
+    }
+
+    const payload = structuredClone(data) as ChatSessionData;
+    const snapshot: SessionSnapshot = {
+      id: crypto.randomUUID(),
+      sessionId,
+      label: label ?? formatAutoLabel(),
+      createdAt: Date.now(),
+      debateCount: payload.debates?.length ?? 0,
+      payload,
+    };
+
+    writeSnapshot(snapshot, this.sessionDir);
+    this.purgeOldSnapshots(sessionId);
+    return snapshot;
+  }
+
+  listSnapshots(sessionId: string): SessionSnapshot[] {
+    return listSnapshotFiles(sessionId, this.sessionDir);
+  }
+
+  restoreSnapshot(sessionId: string, snapshotId: string): void {
+    const snap = readSnapshot(sessionId, snapshotId, this.sessionDir);
+    if (!snap) {
+      throw new Error(
+        `Snapshot not found: ${snapshotId} (session: ${sessionId})`,
+      );
+    }
+
+    const current = this.readSessionData(sessionId);
+    if (current) {
+      const autoSnap: SessionSnapshot = {
+        id: crypto.randomUUID(),
+        sessionId,
+        label: `auto-pre-restore-${formatAutoLabel().replace(/^auto-/, "")}`,
+        createdAt: Date.now(),
+        debateCount: current.debates?.length ?? 0,
+        payload: structuredClone(current) as ChatSessionData,
+      };
+      writeSnapshot(autoSnap, this.sessionDir);
+    }
+
+    const restored: SessionData = {
+      ...(structuredClone(snap.payload) as ChatSessionData),
+      id: sessionId,
+      updatedAt: new Date().toISOString(),
+    } as SessionData;
+
+    this.ensureSessionDir();
+    const filePath = this.getSessionPath(sessionId);
+    const tmpPath = `${filePath}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(restored, null, 2), "utf-8");
+    fs.renameSync(tmpPath, filePath);
+  }
+
+  deleteSnapshot(sessionId: string, snapshotId: string): void {
+    const removed = deleteSnapshotFile(sessionId, snapshotId, this.sessionDir);
+    if (!removed) {
+      throw new Error(
+        `Snapshot not found: ${snapshotId} (session: ${sessionId})`,
+      );
+    }
+  }
+
+  private purgeOldSnapshots(sessionId: string): void {
+    const snaps = this.listSnapshots(sessionId);
+    if (snaps.length <= MAX_SNAPSHOTS_PER_SESSION) return;
+    const toRemove = snaps.slice(MAX_SNAPSHOTS_PER_SESSION);
+    for (const snap of toRemove) {
+      deleteSnapshotFile(sessionId, snap.id, this.sessionDir);
+    }
+  }
+
+  forkSession(sourceSessionId: string, newName?: string): string {
+    const data = this.readSessionData(sourceSessionId);
+    if (!data) {
+      throw new Error(`Session not found: ${sourceSessionId}`);
+    }
+
+    const cloned = structuredClone(data) as SessionData;
+    const newId = generateId("session");
+    const now = new Date().toISOString();
+    const sourceName = data.name || data.debates?.[0]?.topic || "Untitled";
+    cloned.id = newId;
+    cloned.name = newName ?? `${sourceName} (fork)`;
+    cloned.forkedFrom = sourceSessionId;
+    cloned.createdAt = now;
+    cloned.updatedAt = now;
+
+    this.ensureSessionDir();
+    const filePath = this.getSessionPath(newId);
+    const tmpPath = `${filePath}.${process.pid}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(cloned, null, 2), "utf-8");
+    fs.renameSync(tmpPath, filePath);
+
+    return newId;
+  }
+}
+
+export function snapshotSession(
+  sessionId: string,
+  label?: string,
+): SessionSnapshot {
+  return new SessionManager().snapshotSession(sessionId, label);
+}
+
+export function listSnapshots(sessionId: string): SessionSnapshot[] {
+  return new SessionManager().listSnapshots(sessionId);
+}
+
+export function restoreSnapshot(sessionId: string, snapshotId: string): void {
+  new SessionManager().restoreSnapshot(sessionId, snapshotId);
+}
+
+export function deleteSnapshot(sessionId: string, snapshotId: string): void {
+  new SessionManager().deleteSnapshot(sessionId, snapshotId);
+}
+
+export function forkSession(sourceSessionId: string, newName?: string): string {
+  return new SessionManager().forkSession(sourceSessionId, newName);
 }

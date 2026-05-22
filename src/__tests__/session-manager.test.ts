@@ -20,18 +20,22 @@ vi.mock("node:os", () => ({
 }));
 
 vi.mock("../api/client", () => ({
-  ConsiliumClient: vi.fn().mockImplementation(() => ({})),
+  ConsiliumClient: vi.fn(function () {
+    return {};
+  }),
 }));
 
 vi.mock("./context-manager", () => ({
-  ContextManager: vi.fn().mockImplementation(() => ({
-    addFile: vi.fn(),
-    clear: vi.fn(),
-    buildContext: vi.fn().mockReturnValue(""),
-    getFiles: vi.fn().mockReturnValue([]),
-    getFilesWithContent: vi.fn().mockReturnValue([]),
-    getImages: vi.fn().mockReturnValue([]),
-  })),
+  ContextManager: vi.fn(function () {
+    return {
+      addFile: vi.fn(),
+      clear: vi.fn(),
+      buildContext: vi.fn().mockReturnValue(""),
+      getFiles: vi.fn().mockReturnValue([]),
+      getFilesWithContent: vi.fn().mockReturnValue([]),
+      getImages: vi.fn().mockReturnValue([]),
+    };
+  }),
 }));
 
 const SESSION_DIR = TMP_HOME + "/.consilium/sessions";
@@ -113,8 +117,8 @@ describe("listSessions", () => {
     );
     const sessions = sm.listSessions();
     expect(sessions).toHaveLength(2);
-    expect(sessions[0].id).toBe("ses_new");
-    expect(sessions[1].id).toBe("ses_old");
+    expect(sessions[0]!.id).toBe("ses_new");
+    expect(sessions[1]!.id).toBe("ses_old");
   });
 
   it("skips malformed JSON files", () => {
@@ -123,7 +127,7 @@ describe("listSessions", () => {
     writeSessionFile("ses_good", makeSessionData({ id: "ses_good" }));
     const sessions = sm.listSessions();
     expect(sessions).toHaveLength(1);
-    expect(sessions[0].id).toBe("ses_good");
+    expect(sessions[0]!.id).toBe("ses_good");
   });
 });
 
@@ -280,8 +284,8 @@ describe("searchSessions", () => {
     );
     const results = sm.searchSessions("database");
     expect(results).toHaveLength(1);
-    expect(results[0].matchType).toBe("topic");
-    expect(results[0].debateTopic).toContain("database");
+    expect(results[0]!.matchType).toBe("topic");
+    expect(results[0]!.debateTopic).toContain("database");
   });
 
   it("finds sessions by synthesis content", () => {
@@ -301,7 +305,7 @@ describe("searchSessions", () => {
     );
     const results = sm.searchSessions("pagination");
     expect(results).toHaveLength(1);
-    expect(results[0].matchType).toBe("synthesis");
+    expect(results[0]!.matchType).toBe("synthesis");
   });
 
   it("search is case-insensitive", () => {

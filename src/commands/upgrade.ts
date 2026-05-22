@@ -2,6 +2,10 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createRequire } from "node:module";
 import { style } from "../utils/visual-system.js";
+import {
+  fetchReleaseNotes,
+  releaseNotesUrl,
+} from "../utils/changelog-fetcher.js";
 
 const execFileAsync = promisify(execFile);
 const st = style();
@@ -168,6 +172,7 @@ export async function upgradeCommand(
           "  Restart any running Consilium processes to pick up the new version.",
         ),
       );
+      await printWhatsNew(latestVersion);
     } else {
       console.log(
         st.warning("  Upgrade not supported for this install method."),
@@ -181,5 +186,28 @@ export async function upgradeCommand(
         `    ${manager} ${manager === "yarn" ? "global add" : "add -g"} ${PACKAGE}@latest`,
       ),
     );
+  }
+}
+
+async function printWhatsNew(version: string): Promise<void> {
+  try {
+    const notes = await fetchReleaseNotes(version);
+    if (!notes) {
+      console.log("");
+      console.log(st.dim(`  Release notes: ${releaseNotesUrl(version)}`));
+      return;
+    }
+    const dateSuffix = notes.date ? ` (${notes.date})` : "";
+    console.log("");
+    console.log(
+      `${st.brand(`What's new in v${notes.version}`)}${st.dim(dateSuffix)}`,
+    );
+    console.log("");
+    console.log(notes.body);
+    console.log("");
+    console.log(st.dim(`  Full notes: ${releaseNotesUrl(notes.version)}`));
+  } catch {
+    console.log("");
+    console.log(st.dim(`  Release notes: ${releaseNotesUrl(version)}`));
   }
 }

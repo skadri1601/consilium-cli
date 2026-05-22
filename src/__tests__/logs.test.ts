@@ -25,10 +25,12 @@ vi.mock("../utils/require-auth", () => ({
 }));
 
 vi.mock("../api/client", () => ({
-  ConsiliumClient: vi.fn().mockImplementation(() => ({
-    getApiUrl: () => "https://api.myconsilium.xyz",
-    getDebateDetails: vi.fn().mockRejectedValue(new Error("not found")),
-  })),
+  ConsiliumClient: vi.fn(function () {
+    return {
+      getApiUrl: () => "https://api.myconsilium.xyz",
+      getDebateDetails: vi.fn().mockRejectedValue(new Error("not found")),
+    };
+  }),
 }));
 
 vi.mock("../utils/visual-system", () => ({

@@ -39,7 +39,7 @@ describe("ContextManager", () => {
 
       const files = manager.getFiles();
       expect(files).toHaveLength(1);
-      expect(files[0].name).toBe("test.txt");
+      expect(files[0]!.name).toBe("test.txt");
     });
 
     it("throws for non-existent file", () => {
@@ -85,8 +85,8 @@ describe("ContextManager", () => {
 
       const images = manager.getImages();
       expect(images).toHaveLength(1);
-      expect(images[0].name).toBe("photo.png");
-      expect(images[0].base64.length).toBeGreaterThan(0);
+      expect(images[0]!.name).toBe("photo.png");
+      expect(images[0]!.base64.length).toBeGreaterThan(0);
     });
 
     it("throws for non-existent image", () => {
@@ -124,7 +124,7 @@ describe("ContextManager", () => {
       manager.addFile(fp);
 
       const files = manager.getFiles();
-      expect(files[0].size).toBe(content.length);
+      expect(files[0]!.size).toBe(content.length);
     });
   });
 
@@ -139,7 +139,7 @@ describe("ContextManager", () => {
 
       const images = manager.getImages();
       expect(images).toHaveLength(1);
-      expect(typeof images[0].base64).toBe("string");
+      expect(typeof images[0]!.base64).toBe("string");
     });
   });
 
@@ -221,8 +221,8 @@ describe("ContextManager", () => {
 
       const result = manager.getFilesWithContent();
       expect(result).toHaveLength(1);
-      expect(result[0].name).toBe("code.js");
-      expect(result[0].content).toBe('console.log("hi")');
+      expect(result[0]!.name).toBe("code.js");
+      expect(result[0]!.content).toBe('console.log("hi")');
     });
   });
 });

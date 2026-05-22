@@ -8,6 +8,7 @@ import {
   restoreRollbackSnapshot,
   type RollbackSnapshot,
 } from "./rollback";
+import { safeRunHooks, shouldBlock } from "../hooks/runner";
 
 const AUDIT_FILE = path.join(
   os.homedir(),

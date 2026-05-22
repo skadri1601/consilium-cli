@@ -64,9 +64,9 @@ describe("DecisionLog", () => {
       const json = log.toJSON();
       const restored = DecisionLog.fromJSON(json);
       expect(restored.decisions).toHaveLength(1);
-      expect(restored.decisions[0].category).toBe("AUTH");
-      expect(restored.decisions[0].statement).toBe("Use JWT tokens");
-      expect(restored.decisions[0].supportingModels).toEqual([
+      expect(restored.decisions[0]!.category).toBe("AUTH");
+      expect(restored.decisions[0]!.statement).toBe("Use JWT tokens");
+      expect(restored.decisions[0]!.supportingModels).toEqual([
         "gpt-4o",
         "claude-3",
       ]);
@@ -99,10 +99,10 @@ describe("DecisionLog", () => {
       log.resolveDecision("DATABASE", "Use PostgreSQL", 1);
 
       expect(log.decisions).toHaveLength(2);
-      expect(log.decisions[0].status).toBe("superseded");
-      expect(log.decisions[0].resolvedBy).toBe(1);
-      expect(log.decisions[1].status).toBe("decided");
-      expect(log.decisions[1].statement).toBe("Use PostgreSQL");
+      expect(log.decisions[0]!.status).toBe("superseded");
+      expect(log.decisions[0]!.resolvedBy).toBe(1);
+      expect(log.decisions[1]!.status).toBe("decided");
+      expect(log.decisions[1]!.statement).toBe("Use PostgreSQL");
     });
 
     it("supersedes tentative decisions", () => {
@@ -117,8 +117,8 @@ describe("DecisionLog", () => {
 
       log.resolveDecision("API", "Use GraphQL", 2);
 
-      expect(log.decisions[0].status).toBe("superseded");
-      expect(log.decisions[1].statement).toBe("Use GraphQL");
+      expect(log.decisions[0]!.status).toBe("superseded");
+      expect(log.decisions[1]!.statement).toBe("Use GraphQL");
     });
 
     it("does not supersede already-decided items", () => {
@@ -133,8 +133,8 @@ describe("DecisionLog", () => {
 
       log.resolveDecision("AUTH", "Use SAML", 1);
 
-      expect(log.decisions[0].status).toBe("decided");
-      expect(log.decisions[0].statement).toBe("Use OAuth");
+      expect(log.decisions[0]!.status).toBe("decided");
+      expect(log.decisions[0]!.statement).toBe("Use OAuth");
       expect(log.decisions).toHaveLength(2);
     });
   });
@@ -213,8 +213,8 @@ describe("extractDecisionsFromText", () => {
     const decisions = extractDecisionsFromText(text, "db-topic", 0);
 
     expect(decisions.length).toBeGreaterThanOrEqual(1);
-    expect(decisions[0].status).toBe("decided");
-    expect(decisions[0].category).toBe("DATABASE");
+    expect(decisions[0]!.status).toBe("decided");
+    expect(decisions[0]!.category).toBe("DATABASE");
   });
 
   it("extracts tentative patterns", () => {
@@ -222,7 +222,7 @@ describe("extractDecisionsFromText", () => {
     const decisions = extractDecisionsFromText(text, "cache-topic", 1);
 
     expect(decisions.length).toBeGreaterThanOrEqual(1);
-    expect(decisions[0].status).toBe("tentative");
+    expect(decisions[0]!.status).toBe("tentative");
   });
 
   it("extracts open patterns", () => {
@@ -230,8 +230,8 @@ describe("extractDecisionsFromText", () => {
     const decisions = extractDecisionsFromText(text, "auth-topic", 2);
 
     expect(decisions.length).toBeGreaterThanOrEqual(1);
-    expect(decisions[0].status).toBe("open");
-    expect(decisions[0].confidence).toBe("low");
+    expect(decisions[0]!.status).toBe("open");
+    expect(decisions[0]!.confidence).toBe("low");
   });
 
   it("returns empty for text without decisions", () => {
@@ -258,7 +258,7 @@ describe("extractDecisionsFromText", () => {
     const decisions = extractDecisionsFromText(text, "perf", 0);
 
     expect(decisions.length).toBeGreaterThanOrEqual(1);
-    expect(decisions[0].category).toBe("RATE_LIMITING");
+    expect(decisions[0]!.category).toBe("RATE_LIMITING");
   });
 
   it("assigns GENERAL when no keyword matches", () => {
@@ -266,7 +266,7 @@ describe("extractDecisionsFromText", () => {
     const decisions = extractDecisionsFromText(text, "process", 0);
 
     expect(decisions.length).toBeGreaterThanOrEqual(1);
-    expect(decisions[0].category).toBe("GENERAL");
+    expect(decisions[0]!.category).toBe("GENERAL");
   });
 
   it('handles "decided on" pattern', () => {
@@ -274,8 +274,8 @@ describe("extractDecisionsFromText", () => {
     const decisions = extractDecisionsFromText(text, "arch", 0);
 
     expect(decisions.length).toBeGreaterThanOrEqual(1);
-    expect(decisions[0].status).toBe("decided");
-    expect(decisions[0].category).toBe("ARCHITECTURE");
+    expect(decisions[0]!.status).toBe("decided");
+    expect(decisions[0]!.category).toBe("ARCHITECTURE");
   });
 
   it("strips trailing punctuation from statements", () => {
@@ -283,7 +283,7 @@ describe("extractDecisionsFromText", () => {
     const decisions = extractDecisionsFromText(text, "auth", 0);
 
     expect(decisions.length).toBeGreaterThanOrEqual(1);
-    expect(decisions[0].statement).not.toMatch(/[.!]$/);
+    expect(decisions[0]!.statement).not.toMatch(/[.!]$/);
   });
 
   it("preserves debateIndex on all extracted decisions", () => {

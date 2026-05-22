@@ -259,6 +259,10 @@ function findEntryByInput(input: string): MenuEntry | null {
   );
 }
 
+export async function menuCommand(): Promise<void> {
+  await showMenu();
+}
+
 export async function showMenu(): Promise<void> {
   const config = loadConfig();
   process.stdout.write(renderHelp(config.userName));

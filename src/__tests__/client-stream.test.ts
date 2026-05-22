@@ -1,6 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const { eventSourceInstances, FakeEventSource } = vi.hoisted(() => {
+  type FakeInit = {
+    headers?: Record<string, string>;
+    fetch?: (
+      url: string,
+      init: { headers?: Record<string, string> },
+    ) => Promise<Response>;
+  };
+
   const instances: Array<{
     url: string;
     init?: { headers?: Record<string, string> };
@@ -14,9 +22,27 @@ const { eventSourceInstances, FakeEventSource } = vi.hoisted(() => {
     init?: { headers?: Record<string, string> };
     onmessage: ((e: MessageEvent) => void) | null = null;
     onerror: ((e: Event) => void) | null = null;
-    constructor(url: string, init?: { headers?: Record<string, string> }) {
+    constructor(url: string, init?: FakeInit) {
       this.url = url;
-      this.init = init;
+      const captured: Record<string, string> = {};
+      if (init?.headers) Object.assign(captured, init.headers);
+      if (init?.fetch) {
+        const sniffer = {
+          headers: {},
+        } as { headers: Record<string, string> };
+        const originalFetch = globalThis.fetch;
+        globalThis.fetch = ((_u: unknown, i: RequestInit) => {
+          Object.assign(sniffer.headers, i?.headers ?? {});
+          return Promise.resolve(new Response(""));
+        }) as typeof fetch;
+        try {
+          void init.fetch(url, { headers: {} });
+        } finally {
+          globalThis.fetch = originalFetch;
+        }
+        Object.assign(captured, sniffer.headers);
+      }
+      this.init = { headers: captured };
       instances.push(this);
     }
     close() {}
@@ -25,7 +51,10 @@ const { eventSourceInstances, FakeEventSource } = vi.hoisted(() => {
   return { eventSourceInstances: instances, FakeEventSource };
 });
 
-vi.mock("eventsource", () => ({ default: FakeEventSource }));
+vi.mock("eventsource", () => ({
+  default: FakeEventSource,
+  EventSource: FakeEventSource,
+}));
 
 vi.mock("../utils/config", () => ({
   loadConfig: () => ({ apiUrl: "http://test", apiKey: "consilium_x" }),

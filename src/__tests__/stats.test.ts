@@ -29,7 +29,9 @@ vi.mock("../utils/config", () => ({
 }));
 
 vi.mock("../api/client", () => ({
-  ConsiliumClient: vi.fn().mockImplementation(() => ({})),
+  ConsiliumClient: vi.fn(function () {
+    return {};
+  }),
 }));
 
 beforeEach(() => {

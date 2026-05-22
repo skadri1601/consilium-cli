@@ -6,6 +6,8 @@ import { DecisionLog } from "../utils/decision-extractor";
 import { DebateMode, getDefaultMode } from "../utils/debate-modes";
 import { OutputFormat } from "../utils/output-formatter";
 import { type ScanManifest, type ScannedFile } from "../utils/project-scanner";
+import { getSessionExtras, replayAutonomy } from "./chat-slash-dispatch";
+import { maybeAppendFromSynthesis } from "../utils/auto-memory";
 const MAX_CONTEXT_CHARS = 80_000;
 
 export interface DebateRecord {
@@ -140,12 +142,20 @@ export class ChatSession {
   }
 
   async debate(userInput: string): Promise<void> {
+    const extras = getSessionExtras(this);
+    const goal = extras?.goal;
+    const reasoningEffort = extras?.reasoningEffort;
+
+    const goalAwareInput = goal
+      ? `(Working toward overall goal: ${goal})\n\n${userInput}`
+      : userInput;
+
     const context = this.contextManager.buildContext();
     const followUp = this.buildFollowUpContext();
     const decisionContext = this.decisionLog.getContext();
 
     const effectiveTopic = this.buildEffectiveTopic(
-      userInput,
+      goalAwareInput,
       followUp,
       context,
       decisionContext,
@@ -177,11 +187,13 @@ export class ChatSession {
       images,
       projectFiles,
       debateSource: "cli",
+      ...(reasoningEffort ? { reasoningEffort } : {}),
     });
 
     let goldenPrompt = "";
     const handleEvent = createStreamHandlers({
       topic: userInput,
+      models: this.models,
       onComplete: () => {},
     });
 
@@ -204,6 +216,15 @@ export class ChatSession {
 
     if (goldenPrompt) {
       this.decisionLog.addFromSynthesis(goldenPrompt, userInput, debateIndex);
+      try {
+        maybeAppendFromSynthesis({
+          topic: userInput,
+          synthesis: goldenPrompt,
+          source: debate.id || this.id,
+        });
+      } catch {
+        // best-effort; never block on memory writes
+      }
     }
 
     if (!this.name && this.debates.length === 1) {
@@ -254,6 +275,11 @@ export class ChatSession {
     const last = session.debates.at(-1);
     if (last?.goldenPrompt) {
       session.lastGoldenPrompt = last.goldenPrompt;
+    }
+    try {
+      replayAutonomy(session);
+    } catch {
+      // best-effort replay; do not block session load
     }
     return session;
   }

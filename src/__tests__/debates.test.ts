@@ -17,14 +17,16 @@ const {
 }));
 
 vi.mock("../api/client", () => ({
-  ConsiliumClient: vi.fn().mockImplementation(() => ({
-    listDebates: mockListDebates,
-    cancelDebate: mockCancelDebate,
-    cancelDeliberation: mockCancelDeliberation,
-    createDebate: mockCreateDebate,
-    streamDebate: mockStreamDebate,
-    streamDeliberation: mockStreamDeliberation,
-  })),
+  ConsiliumClient: vi.fn(function () {
+    return {
+      listDebates: mockListDebates,
+      cancelDebate: mockCancelDebate,
+      cancelDeliberation: mockCancelDeliberation,
+      createDebate: mockCreateDebate,
+      streamDebate: mockStreamDebate,
+      streamDeliberation: mockStreamDeliberation,
+    };
+  }),
   StreamError: class StreamError extends Error {
     kind: string;
     constructor(message: string, kind: string) {

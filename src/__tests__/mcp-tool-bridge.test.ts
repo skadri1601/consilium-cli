@@ -13,12 +13,14 @@ const {
 }));
 
 vi.mock("../utils/mcp-client/registry", () => ({
-  McpRegistry: vi.fn().mockImplementation(() => ({
-    startAll: mockRegistryStartAll,
-    listTools: mockRegistryListTools,
-    callTool: mockRegistryCallTool,
-    stopAll: mockRegistryStopAll,
-  })),
+  McpRegistry: vi.fn(function () {
+    return {
+      startAll: mockRegistryStartAll,
+      listTools: mockRegistryListTools,
+      callTool: mockRegistryCallTool,
+      stopAll: mockRegistryStopAll,
+    };
+  }),
 }));
 
 vi.mock("../utils/visual-system", () => ({

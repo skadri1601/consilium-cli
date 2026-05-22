@@ -14,6 +14,7 @@ import {
 import { typography } from "./typography";
 import { terminal } from "./terminal-capabilities";
 import { updateLine, stopUpdates } from "./animation-controller";
+import { globalTodos, type Todo } from "./todo-tracker";
 
 const st = style();
 const W = () => terminal.width;
@@ -75,6 +76,11 @@ function renderAgentCard(card: AgentCardState, w: number): string[] {
 export interface StreamRenderOptions {
   onComplete?: () => void;
   topic?: string;
+  models?: string[];
+}
+
+function renderTodos(): string {
+  return globalTodos.render();
 }
 
 export function createStreamHandlers(options: StreamRenderOptions = {}) {
@@ -85,6 +91,29 @@ export function createStreamHandlers(options: StreamRenderOptions = {}) {
   let consensusText = "";
   let completionNotified = false;
   const useLiveUpdate = terminal.isTTY && !terminal.usePlain;
+  const todoByAgent = new Map<string, Todo>();
+  let todosPrimed = false;
+
+  function primeTodos(): void {
+    if (todosPrimed) return;
+    todosPrimed = true;
+    globalTodos.clear();
+    todoByAgent.clear();
+    const list = options.models ?? [];
+    for (const agent of list) {
+      const todo = globalTodos.add(`${agent}: analyzing`);
+      todoByAgent.set(agent, todo);
+    }
+  }
+
+  function ensureTodoForAgent(agent: string): Todo {
+    let entry = todoByAgent.get(agent);
+    if (!entry) {
+      entry = globalTodos.add(`${agent}: analyzing`);
+      todoByAgent.set(agent, entry);
+    }
+    return entry;
+  }
 
   function buildFrame(): string {
     const w = W();
@@ -99,6 +128,10 @@ export function createStreamHandlers(options: StreamRenderOptions = {}) {
       contentLine(`  ${agentPart} • Status: ${statusPart}`, w),
       st.dim(borderBottom(w)) + "\n",
     ];
+
+    if (todosPrimed) {
+      parts.push(renderTodos() + "\n");
+    }
 
     for (const card of agents) {
       parts.push(renderAgentCard(card, w).join("\n") + "\n");
@@ -148,12 +181,17 @@ export function createStreamHandlers(options: StreamRenderOptions = {}) {
 
   function onDebateStart(event: DebateEvent): void {
     topic = event.text || options.topic || "";
+    primeTodos();
     if (useLiveUpdate) return;
     console.log(st.dim("\n" + border("Consilium Debate", W())));
     console.log(borderLine(W()));
     console.log(contentLine(`  Topic: ${(topic || "…").slice(0, 60)}`, W()));
     console.log(contentLine("  Agents: … • Status: In Progress", W()));
     console.log(st.dim(borderBottom(W())) + "\n");
+    if (todosPrimed) {
+      console.log(renderTodos());
+      console.log("");
+    }
   }
 
   function onAgentStart(event: DebateEvent): void {
@@ -166,6 +204,9 @@ export function createStreamHandlers(options: StreamRenderOptions = {}) {
       startTime: Date.now(),
     });
     currentIndex = agents.length - 1;
+    primeTodos();
+    const todo = ensureTodoForAgent(name);
+    globalTodos.update(todo.id, "in_progress");
     if (useLiveUpdate) {
       updateLine(buildFrame());
       return;
@@ -196,15 +237,35 @@ export function createStreamHandlers(options: StreamRenderOptions = {}) {
     if (card) {
       card.status = "done";
       card.durationMs = Date.now() - card.startTime;
+      const todo = todoByAgent.get(card.name);
+      if (todo) globalTodos.update(todo.id, "completed");
     }
     if (useLiveUpdate) {
       updateLine(buildFrame());
     } else {
       const label = (agents[currentIndex]?.name || "Unknown").padEnd(22);
       console.log(st.dim("  └─ ") + st.success("✓ " + label + " done"));
+      if (todosPrimed) {
+        console.log(renderTodos());
+      }
       console.log("");
     }
     currentIndex = -1;
+  }
+
+  function finalizeTodos(): void {
+    if (!todosPrimed) return;
+    for (const todo of todoByAgent.values()) {
+      const current = globalTodos.list().find((t) => t.id === todo.id);
+      if (current && current.status !== "completed") {
+        globalTodos.update(todo.id, "completed");
+      }
+    }
+    console.log(renderTodos());
+    console.log("");
+    globalTodos.clear();
+    todoByAgent.clear();
+    todosPrimed = false;
   }
 
   function onConsensus(event: DebateEvent): void {
@@ -221,6 +282,7 @@ export function createStreamHandlers(options: StreamRenderOptions = {}) {
       console.log(st.dim(borderBottom(W())) + "\n");
       console.log(st.success("  ✓ Debate complete.\n"));
     }
+    finalizeTodos();
     if (!completionNotified) {
       completionNotified = true;
       options.onComplete?.();
@@ -230,6 +292,7 @@ export function createStreamHandlers(options: StreamRenderOptions = {}) {
   function onDone(): void {
     if (useLiveUpdate && !consensusText) flushFinal();
     if (!useLiveUpdate) console.log(st.success("  ✓ Debate complete.\n"));
+    finalizeTodos();
     if (!completionNotified) {
       completionNotified = true;
       options.onComplete?.();

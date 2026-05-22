@@ -1,5 +1,7 @@
 import readline from "node:readline";
 import path from "node:path";
+import fs from "node:fs";
+import { spawn } from "node:child_process";
 import ora from "ora";
 import { ConsiliumClient } from "../api/client";
 import { ContextManager } from "../utils/context-manager";
@@ -18,6 +20,29 @@ import { terminal } from "../utils/terminal-capabilities";
 import { loadWorkspaceDebateContext } from "../utils/workspace-debate-context";
 import { log } from "../utils/logger";
 import { dispatchSlashCommand } from "./chat-slash-dispatch";
+import { requestCodebasePermission } from "../utils/codebase-permissions";
+import { resolveProjectRoot } from "../utils/project-root";
+import { getActiveTheme, type Theme } from "../utils/themes";
+import {
+  cycleMode,
+  describeMode,
+  getCurrentMode,
+  type PermissionMode,
+} from "../utils/permission-modes";
+import {
+  parseAtMentions,
+  isShellPassthrough,
+  extractShellCommand,
+  isDangerousShellCommand,
+  attachImage,
+  attachBase64Image,
+  detectImageBase64Mime,
+  isImagePath,
+} from "../utils/chat-input-parser";
+import { getTUI } from "../utils/tui-renderer";
+import { safeRunHooks, shouldBlock } from "../hooks/runner";
+import { renderStatusLine, getCurrentContext } from "../utils/status-line";
+import { loadMemory } from "../utils/auto-memory";
 
 const DEFAULT_SESSION_DIR = path.join(
   process.env.HOME || process.env.USERPROFILE || "",
@@ -25,138 +50,197 @@ const DEFAULT_SESSION_DIR = path.join(
   "sessions",
 );
 
-const st = style();
-const w = terminal.width;
-const DEFAULT_PROMPT = "consilium > ";
 const INPUT_HISTORY_SIZE = 100;
+const MAX_AT_FILE_BYTES = 100 * 1024;
+const MAX_AT_MENTIONS_PER_INPUT = 8;
+
+const DEFAULT_PROMPT = "consilium > ";
+
+type VimMode = "INSERT" | "NORMAL";
+
+interface VimState {
+  enabled: boolean;
+  mode: VimMode;
+  pendingKey: string | null;
+}
+
+const vimState: VimState = {
+  enabled:
+    process.env.CONSILIUM_VIM_MODE === "1" ||
+    process.env.CONSILIUM_VIM_MODE === "true",
+  mode: "INSERT",
+  pendingKey: null,
+};
+
+const st = style();
+const theme: Theme = getActiveTheme();
+const w = terminal.width;
+
+function vimSuffix(): string {
+  if (!vimState.enabled) return "";
+  const tag = vimState.mode === "NORMAL" ? "[NORMAL]" : "[INSERT]";
+  return terminal.hasColor ? theme.dim(tag + " ") : tag + " ";
+}
+
+function modeIndicator(): string {
+  let mode: PermissionMode;
+  try {
+    mode = getCurrentMode();
+  } catch {
+    return "";
+  }
+  const tag = `[${mode}]`;
+  if (!terminal.hasColor) return tag + " ";
+  if (mode === "plan") return theme.warning(tag) + " ";
+  if (mode === "bypass") return theme.error(tag) + " ";
+  if (mode === "acceptEdits" || mode === "auto") return theme.brand(tag) + " ";
+  return theme.dim(tag) + " ";
+}
 
 function getPrompt(session: ChatSession): string {
-  return formatPrompt({ fileCount: session.contextFilePaths.length }) + " ";
+  const base = formatPrompt({ fileCount: session.contextFilePaths.length });
+  return `${modeIndicator()}${vimSuffix()}${base} `;
 }
 
 function printWelcome(): void {
-  console.log(st.dim("\n" + border("Consilium", w)));
+  console.log(theme.dim("\n" + border("Consilium", w)));
   console.log(contentLine("  Multi-Agent Debate Platform", w));
   console.log(contentLine("", w));
   console.log(contentLine("  Type your question to start a debate", w));
   console.log(
     contentLine(
-      "  Use / for commands  •  ↑↓ for history  •  Ctrl+C to exit",
+      "  Use / for commands  -  @file to attach  -  !cmd for shell  -  Ctrl+C to exit",
       w,
     ),
   );
   console.log(contentLine("", w));
-  console.log(st.dim(borderBottom(w)) + "\n");
+  console.log(theme.dim(borderBottom(w)) + "\n");
 }
 
 function printHelp(): void {
-  console.log(st.bold("\nCommands:\n"));
-  console.log(st.bold("  Debate"));
+  console.log(theme.bold("\nCommands:\n"));
+  console.log(theme.bold("  Debate"));
   console.log(
-    st.dim("  /ask <topic>    - Run one debate (same as typing the topic)"),
+    theme.dim("  /ask <topic>    - Run one debate (same as typing the topic)"),
   );
   console.log(
-    st.dim("  /mode [mode]    - Set debate mode: quick, council, deep, blind"),
+    theme.dim(
+      "  /mode [mode]    - Set debate mode: quick, council, deep, blind",
+    ),
   );
-  console.log(st.dim("  /estimate       - Show cost estimate for next debate"));
   console.log(
-    st.dim(
+    theme.dim("  /estimate       - Show cost estimate for next debate"),
+  );
+  console.log(
+    theme.dim(
       "  /output [fmt]   - Set output format: markdown, cursorrules, claude-md, json, text",
     ),
   );
-  console.log(st.bold("\n  Context"));
+  console.log(theme.bold("\n  Context"));
   console.log(
-    st.dim(
+    theme.dim(
       "  /file <path>    - Add file to context (max 100KB per file, 500KB total)",
     ),
   );
-  console.log(st.dim("  /image <path>   - Add image to context"));
+  console.log(theme.dim("  /image <path>   - Add image to context"));
   console.log(
-    st.dim("  /workspace      - Detect project and show workspace info"),
+    theme.dim(
+      "  @path/to/file   - Inline a file's content into your next message",
+    ),
   );
   console.log(
-    st.dim("  /context        - Show context window usage and token budget"),
+    theme.dim(
+      "  !cmd            - Run a shell command without sending to a debate",
+    ),
   );
-  console.log(st.dim("  /clear          - Clear context"));
-  console.log(st.bold("\n  Session"));
-  console.log(st.dim("  /status         - Show session status"));
   console.log(
-    st.dim(
+    theme.dim("  /workspace      - Detect project and show workspace info"),
+  );
+  console.log(
+    theme.dim("  /context        - Show context window usage and token budget"),
+  );
+  console.log(theme.dim("  /clear          - Clear context"));
+  console.log(theme.bold("\n  Session"));
+  console.log(theme.dim("  /status         - Show session status"));
+  console.log(
+    theme.dim(
       "  /manifest       - Show workspace context manifest (loaded/skipped files)",
     ),
   );
   console.log(
-    st.dim("  /models [m1 ..] - Set models; no args to show current"),
+    theme.dim("  /models [m1 ..] - Set models; no args to show current"),
   );
   console.log(
-    st.dim("  /save [file]    - Save synthesis to file, or session to disk"),
+    theme.dim("  /save [file]    - Save synthesis to file, or session to disk"),
   );
-  console.log(st.dim("  /history        - Show conversation history"));
-  console.log(st.dim("  /conversations  - List recent conversations"));
-  console.log(st.dim("  /new            - Start a new conversation"));
-  console.log(st.dim("  /sessions       - List all saved sessions"));
-  console.log(st.dim("  /resume <id>    - Resume a saved session"));
-  console.log(st.dim("  /search <query> - Search across all conversations"));
-  console.log(st.dim("  /rename <name>  - Rename current session"));
-  console.log(st.dim("  /delete <id>    - Delete a saved session"));
-  console.log(st.bold("\n  Config"));
+  console.log(theme.dim("  /history        - Show conversation history"));
+  console.log(theme.dim("  /conversations  - List recent conversations"));
+  console.log(theme.dim("  /new            - Start a new conversation"));
+  console.log(theme.dim("  /sessions       - List all saved sessions"));
+  console.log(theme.dim("  /resume <id>    - Resume a saved session"));
+  console.log(theme.dim("  /search <query> - Search across all conversations"));
+  console.log(theme.dim("  /rename <name>  - Rename current session"));
+  console.log(theme.dim("  /delete <id>    - Delete a saved session"));
+  console.log(theme.bold("\n  Config"));
   console.log(
-    st.dim(
+    theme.dim(
       "  /api            - Show API key status; /api set <key> or /api open",
     ),
   );
   console.log(
-    st.dim("  /keys [open|status] - Provider LLM keys page or account status"),
+    theme.dim(
+      "  /keys [open|status] - Provider LLM keys page or account status",
+    ),
   );
-  console.log(st.dim("  /track, /insights - Open web analytics (usage)"));
+  console.log(theme.dim("  /track, /insights - Open web analytics (usage)"));
   console.log(
-    st.dim(
+    theme.dim(
       "  /codebase       - allow | status | revoke local file read for debates",
     ),
   );
   console.log(
-    st.dim(
+    theme.dim(
       "  /permissions    - status | allow-write | revoke-write for read/write policy",
     ),
   );
   console.log(
-    st.dim(
+    theme.dim(
       "  /apply          - Apply structured edits from latest synthesis (preview + permission gated)",
     ),
   );
   console.log(
-    st.dim(
+    theme.dim(
       "  /redo, /again   - Re-run last topic with current workspace permission and files",
     ),
   );
-  console.log(st.dim("  /help           - Show this help"));
-  console.log(st.dim("  /exit           - Exit and save session"));
-  console.log(st.dim("\n  ↑/↓ - Input history\n"));
+  console.log(theme.dim("  /help           - Show this help"));
+  console.log(theme.dim("  /exit           - Exit and save session"));
+  console.log(theme.dim("\n  ↑/↓ - Input history  -  Esc/i toggle vim mode\n"));
 }
 
 function printConversationHistory(session: ChatSession): void {
   if (session.debates.length === 0) {
-    console.log(st.dim("\nNo debates in this session yet.\n"));
+    console.log(theme.dim("\nNo debates in this session yet.\n"));
     return;
   }
 
-  console.log(st.bold("\nConversation History:\n"));
+  console.log(theme.bold("\nConversation History:\n"));
   let historyIndex = 0;
   for (const d of session.debates) {
     historyIndex += 1;
     const topicPreview =
       d.topic.length > 70 ? d.topic.substring(0, 70) + "..." : d.topic;
     const time = d.timestamp
-      ? st.dim(` (${new Date(d.timestamp).toLocaleString()})`)
+      ? theme.dim(` (${new Date(d.timestamp).toLocaleString()})`)
       : "";
-    console.log(st.brand(`  ${historyIndex}.`), topicPreview + time);
+    console.log(theme.brand(`  ${historyIndex}.`), topicPreview + time);
 
     if (d.goldenPrompt) {
       const synthPreview =
         d.goldenPrompt.length > 100
           ? d.goldenPrompt.substring(0, 100) + "..."
           : d.goldenPrompt;
-      console.log(st.dim(`     Synthesis: ${synthPreview}`));
+      console.log(theme.dim(`     Synthesis: ${synthPreview}`));
     }
   }
   console.log("");
@@ -167,21 +251,21 @@ function handleSearchCommand(
   sessionManager: SessionManager,
 ): void {
   if (!query) {
-    console.log(st.warning("Usage: /search <query>"));
+    console.log(theme.warning("Usage: /search <query>"));
     return;
   }
 
   const results = sessionManager.searchSessions(query);
   if (results.length === 0) {
-    console.log(st.dim(`\nNo results for "${query}".\n`));
+    console.log(theme.dim(`\nNo results for "${query}".\n`));
     return;
   }
 
-  console.log(st.bold(`\nSearch results for "${query}":\n`));
+  console.log(theme.bold(`\nSearch results for "${query}":\n`));
   for (const r of results) {
     const typeLabel = r.matchType === "topic" ? "Topic" : "Synthesis";
-    console.log(st.brand(`  [${r.sessionId}]`), r.sessionName);
-    console.log(st.dim(`    ${typeLabel}: ${r.matchSnippet}`));
+    console.log(theme.brand(`  [${r.sessionId}]`), r.sessionName);
+    console.log(theme.dim(`    ${typeLabel}: ${r.matchSnippet}`));
   }
   console.log("");
 }
@@ -189,11 +273,11 @@ function handleSearchCommand(
 function handleSessionsListCommand(sessionManager: SessionManager): void {
   const list = sessionManager.listSessions();
   if (list.length === 0) {
-    console.log(st.dim("\nNo saved sessions.\n"));
+    console.log(theme.dim("\nNo saved sessions.\n"));
     return;
   }
 
-  console.log(st.bold("\nSaved sessions:\n"));
+  console.log(theme.bold("\nSaved sessions:\n"));
   for (let i = 0; i < list.length; i++) {
     const s = list.at(i);
     if (!s) continue;
@@ -203,16 +287,16 @@ function handleSessionsListCommand(sessionManager: SessionManager): void {
       label.length > 50 ? label.substring(0, 50) + "..." : label;
     const debateSuffix = s.debateCount === 1 ? "" : "s";
     console.log(
-      st.brand(`  ${i + 1}.`),
+      theme.brand(`  ${i + 1}.`),
       displayLabel,
-      st.dim(`(${s.debateCount} debate${debateSuffix}, ${timeAgo})`),
+      theme.dim(`(${s.debateCount} debate${debateSuffix}, ${timeAgo})`),
     );
     if (s.preview && s.preview !== "(no synthesis)") {
-      console.log(st.dim(`     ${s.preview}`));
+      console.log(theme.dim(`     ${s.preview}`));
     }
   }
   console.log(
-    st.dim("\n  Resume with: consilium sessions resume <session-id>\n"),
+    theme.dim("\n  Resume with: consilium sessions resume <session-id>\n"),
   );
 }
 
@@ -223,7 +307,7 @@ function handleRenameCommand(
 ): void {
   const newName = args.join(" ").trim();
   if (!newName) {
-    console.log(st.warning("Usage: /rename <new name>"));
+    console.log(theme.warning("Usage: /rename <new name>"));
     return;
   }
 
@@ -231,9 +315,9 @@ function handleRenameCommand(
 
   if (session.id) {
     sessionManager.renameSession(session.id, newName);
-    console.log(st.success(`Session renamed to: ${newName}`));
+    console.log(theme.success(`Session renamed to: ${newName}`));
   } else {
-    console.log(st.success(`Session will be saved as: ${newName}`));
+    console.log(theme.success(`Session will be saved as: ${newName}`));
   }
 }
 
@@ -245,27 +329,30 @@ function handleDeleteCommand(
 ): void {
   const targetId = args[0];
   if (!targetId) {
-    console.log(st.warning("Usage: /delete <session-id>"));
+    console.log(theme.warning("Usage: /delete <session-id>"));
     callback();
     return;
   }
 
-  rl.question(st.warning(`Delete session "${targetId}"? (y/N) `), (answer) => {
-    const confirmed = answer.trim().toLowerCase() === "y";
-    if (!confirmed) {
-      console.log(st.dim("Cancelled."));
-      callback();
-      return;
-    }
+  rl.question(
+    theme.warning(`Delete session "${targetId}"? (y/N) `),
+    (answer) => {
+      const confirmed = answer.trim().toLowerCase() === "y";
+      if (!confirmed) {
+        console.log(theme.dim("Cancelled."));
+        callback();
+        return;
+      }
 
-    const deleted = sessionManager.deleteSession(targetId);
-    if (deleted) {
-      console.log(st.success(`Session "${targetId}" deleted.`));
-    } else {
-      console.log(st.error(`Session not found: ${targetId}`));
-    }
-    callback();
-  });
+      const deleted = sessionManager.deleteSession(targetId);
+      if (deleted) {
+        console.log(theme.success(`Session "${targetId}" deleted.`));
+      } else {
+        console.log(theme.error(`Session not found: ${targetId}`));
+      }
+      callback();
+    },
+  );
 }
 
 async function handleSlashCommand(
@@ -288,7 +375,9 @@ async function handleSlashCommand(
       const last = session.debates.at(-1);
       if (!last?.topic) {
         console.log(
-          st.warning("\nNo previous debate to redo. Ask a question first.\n"),
+          theme.warning(
+            "\nNo previous debate to redo. Ask a question first.\n",
+          ),
         );
         return;
       }
@@ -300,7 +389,7 @@ async function handleSlashCommand(
         session.projectFiles = undefined;
         session.contextManifest = undefined;
       }
-      console.log(st.brand(`\nRe-running: ${last.topic}\n`));
+      console.log(theme.brand(`\nRe-running: ${last.topic}\n`));
       await session.debate(last.topic);
     },
   });
@@ -322,14 +411,329 @@ function pushHistory(history: string[], line: string): void {
   if (history.length > INPUT_HISTORY_SIZE) history.shift();
 }
 
+async function runShellPassthrough(command: string): Promise<void> {
+  if (isDangerousShellCommand(command)) {
+    console.log(
+      theme.error("[SHELL MODE] Blocked dangerous command: " + command),
+    );
+    return;
+  }
+  console.log(theme.brand("[SHELL MODE]"), theme.dim("$ " + command));
+  const shellPath = process.env.SHELL || "/bin/sh";
+  await new Promise<void>((resolve) => {
+    const child = spawn(shellPath, ["-c", command], {
+      stdio: ["ignore", "inherit", "inherit"],
+      env: process.env,
+    });
+    child.on("close", (code) => {
+      if (code !== 0) {
+        console.log(theme.dim(`[SHELL MODE] exit ${code}`));
+      }
+      resolve();
+    });
+    child.on("error", (err) => {
+      console.log(theme.error(`[SHELL MODE] error: ${err.message}`));
+      resolve();
+    });
+  });
+  console.log("");
+}
+
+interface MentionInjectionResult {
+  injectedPrefix: string;
+  injectedCount: number;
+  skipped: string[];
+}
+
+async function buildAtMentionPrefix(
+  mentions: string[],
+): Promise<MentionInjectionResult> {
+  if (mentions.length === 0) {
+    return { injectedPrefix: "", injectedCount: 0, skipped: [] };
+  }
+
+  const limited = mentions.slice(0, MAX_AT_MENTIONS_PER_INPUT);
+  const rootInfo = resolveProjectRoot(process.cwd());
+  const ok = await requestCodebasePermission(rootInfo.root);
+  if (!ok) {
+    console.log(
+      theme.warning(
+        "Codebase read permission denied; @-file references were not attached.",
+      ),
+    );
+    return { injectedPrefix: "", injectedCount: 0, skipped: limited };
+  }
+
+  const parts: string[] = [];
+  const skipped: string[] = [];
+  let injected = 0;
+
+  for (const mention of limited) {
+    const resolved = path.resolve(process.cwd(), mention);
+    const root = rootInfo.root;
+    const inScope = resolved === root || resolved.startsWith(root + path.sep);
+    if (!inScope) {
+      skipped.push(mention);
+      continue;
+    }
+    if (!fs.existsSync(resolved)) {
+      skipped.push(mention);
+      continue;
+    }
+    let stat;
+    try {
+      stat = fs.statSync(resolved);
+    } catch {
+      skipped.push(mention);
+      continue;
+    }
+    if (!stat.isFile()) {
+      skipped.push(mention);
+      continue;
+    }
+    if (stat.size > MAX_AT_FILE_BYTES) {
+      console.log(
+        theme.warning(
+          `@${mention} skipped: file exceeds ${Math.round(MAX_AT_FILE_BYTES / 1024)}KB limit`,
+        ),
+      );
+      skipped.push(mention);
+      continue;
+    }
+    let content: string;
+    try {
+      content = fs.readFileSync(resolved, "utf-8");
+    } catch {
+      skipped.push(mention);
+      continue;
+    }
+    if (content.includes("\0")) {
+      skipped.push(mention);
+      continue;
+    }
+    const lang = inferLanguage(resolved);
+    const fence = "```";
+    parts.push(
+      `Attached file: ${mention}\n${fence}${lang}\n${content}\n${fence}`,
+    );
+    injected += 1;
+  }
+
+  if (mentions.length > MAX_AT_MENTIONS_PER_INPUT) {
+    console.log(
+      theme.warning(
+        `Only the first ${MAX_AT_MENTIONS_PER_INPUT} @-references were attached.`,
+      ),
+    );
+  }
+
+  const injectedPrefix = parts.length > 0 ? parts.join("\n\n") + "\n\n" : "";
+  return { injectedPrefix, injectedCount: injected, skipped };
+}
+
+function inferLanguage(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  const map: Record<string, string> = {
+    ".ts": "ts",
+    ".tsx": "tsx",
+    ".js": "js",
+    ".jsx": "jsx",
+    ".py": "python",
+    ".rb": "ruby",
+    ".go": "go",
+    ".rs": "rust",
+    ".java": "java",
+    ".kt": "kotlin",
+    ".swift": "swift",
+    ".cpp": "cpp",
+    ".c": "c",
+    ".h": "c",
+    ".cs": "csharp",
+    ".php": "php",
+    ".sh": "bash",
+    ".yml": "yaml",
+    ".yaml": "yaml",
+    ".json": "json",
+    ".md": "markdown",
+    ".sql": "sql",
+    ".html": "html",
+    ".css": "css",
+    ".scss": "scss",
+  };
+  return map[ext] ?? "";
+}
+
+async function tryAttachPastedImage(
+  input: string,
+  session: ChatSession,
+): Promise<boolean> {
+  const trimmed = input.trim();
+  if (!trimmed) return false;
+
+  if (isImagePath(trimmed) && !trimmed.includes(" ")) {
+    try {
+      const att = await attachImage(trimmed);
+      session.contextManager.addImage(trimmed);
+      session.contextImagePaths.push(trimmed);
+      console.log(
+        theme.success(`Attached image ${att.name} (${att.mimeType}).`),
+      );
+      return true;
+    } catch (err) {
+      console.log(
+        theme.error(
+          `Could not attach image: ${err instanceof Error ? err.message : String(err)}`,
+        ),
+      );
+      return true;
+    }
+  }
+
+  if (detectImageBase64Mime(trimmed)) {
+    try {
+      const att = attachBase64Image(trimmed, "pasted");
+      const tmpName = `${att.name}-${Date.now()}`;
+      session.contextImagePaths.push(tmpName);
+      console.log(theme.success(`Attached pasted ${att.mimeType} image.`));
+      return true;
+    } catch (err) {
+      console.log(
+        theme.error(
+          `Could not decode pasted image: ${err instanceof Error ? err.message : String(err)}`,
+        ),
+      );
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function installModeCycleKeybinding(rl: readline.Interface): void {
+  if (!process.stdin.isTTY) return;
+  try {
+    readline.emitKeypressEvents(process.stdin, rl);
+  } catch {
+    return;
+  }
+  process.stdin.on("keypress", (_str, key) => {
+    if (!key) return;
+    if (key.shift && key.name === "tab") {
+      const next = cycleMode();
+      process.stdout.write(`\n[mode] ${next} - ${describeMode(next)}\n`);
+      const session = currentSessionRef;
+      rl.setPrompt(session ? getPrompt(session) : DEFAULT_PROMPT);
+      rl.prompt(true);
+    }
+  });
+}
+
+function installVimKeybindings(rl: readline.Interface): void {
+  if (!vimState.enabled) return;
+  if (!process.stdin.isTTY) return;
+
+  try {
+    readline.emitKeypressEvents(process.stdin);
+    if (typeof process.stdin.setRawMode === "function") {
+      process.stdin.setRawMode(true);
+    }
+  } catch {
+    return;
+  }
+
+  process.stdin.on("keypress", (_str, key) => {
+    if (!key) return;
+    if (key.ctrl && key.name === "c") {
+      rl.close();
+      return;
+    }
+    if (key.name === "escape") {
+      if (vimState.mode !== "NORMAL") {
+        vimState.mode = "NORMAL";
+        rl.setPrompt(getPromptForCurrentSession() || DEFAULT_PROMPT);
+        rl.prompt(true);
+      }
+      vimState.pendingKey = null;
+      return;
+    }
+    if (vimState.mode === "NORMAL") {
+      handleVimNormalKey(key, rl);
+    }
+  });
+}
+
+let currentSessionRef: ChatSession | null = null;
+
+function getPromptForCurrentSession(): string | null {
+  if (!currentSessionRef) return null;
+  return getPrompt(currentSessionRef);
+}
+
+function handleVimNormalKey(
+  key: { name?: string; sequence?: string },
+  rl: readline.Interface,
+): void {
+  const name = key.name ?? "";
+  if (name === "i" || name === "a") {
+    vimState.mode = "INSERT";
+    vimState.pendingKey = null;
+    rl.setPrompt(getPromptForCurrentSession() || DEFAULT_PROMPT);
+    rl.prompt(true);
+    return;
+  }
+  if (name === "d") {
+    if (vimState.pendingKey === "d") {
+      (rl as unknown as { line?: string }).line = "";
+      (rl as unknown as { cursor?: number }).cursor = 0;
+      rl.setPrompt(getPromptForCurrentSession() || DEFAULT_PROMPT);
+      rl.prompt(true);
+      vimState.pendingKey = null;
+      return;
+    }
+    vimState.pendingKey = "d";
+    return;
+  }
+  if (name === "colon" || key.sequence === ":") {
+    vimState.pendingKey = ":";
+    return;
+  }
+  if (vimState.pendingKey === ":" && name === "q") {
+    rl.close();
+    return;
+  }
+  if (name === "k") {
+    process.stdout.write("\x1b[A");
+    vimState.pendingKey = null;
+    return;
+  }
+  if (name === "j") {
+    process.stdout.write("\x1b[B");
+    vimState.pendingKey = null;
+    return;
+  }
+  if (name === "h") {
+    process.stdout.write("\x1b[D");
+    vimState.pendingKey = null;
+    return;
+  }
+  if (name === "l") {
+    process.stdout.write("\x1b[C");
+    vimState.pendingKey = null;
+    return;
+  }
+  vimState.pendingKey = null;
+}
+
 function runReplLoop(
   rl: readline.Interface,
   history: string[],
   session: ChatSession,
   sessionManager: SessionManager,
 ): void {
+  currentSessionRef = session;
   rl.question(getPrompt(session), (line) => {
-    const trimmed = (line || "").trim();
+    const raw = line || "";
+    const trimmed = raw.trim();
     if (!trimmed) {
       runReplLoop(rl, history, session, sessionManager);
       return;
@@ -337,107 +741,151 @@ function runReplLoop(
 
     pushHistory(history, trimmed);
 
-    if (trimmed.toLowerCase().startsWith("/ask")) {
-      const topic = trimmed.slice(4).trim();
-      if (!topic) {
-        console.log(st.warning("Usage: /ask <topic>"));
+    void safeRunHooks("UserPromptSubmit", {
+      prompt: trimmed,
+      sessionId: session.id ?? null,
+    }).then((hookResults) => {
+      if (shouldBlock(hookResults)) {
+        console.error(
+          theme.warning("[hooks] UserPromptSubmit blocked this input"),
+        );
         runReplLoop(rl, history, session, sessionManager);
         return;
       }
-      session.debate(topic).then(
-        () => {
-          autoSave(session, sessionManager);
-          runReplLoop(rl, history, session, sessionManager);
-        },
-        (error: any) => {
-          console.error(st.error("\nDebate failed:"), error.message);
-          if (error.message.includes("503")) {
-            console.log(
-              st.warning(
-                "Suggestion: Make sure the agents service is running.",
-              ),
-            );
-            console.log(
-              st.dim(
-                "   cd apps/agents && poetry run uvicorn src.main:app --reload --port 8000",
-              ),
-            );
-          }
-          console.log(
-            st.dim("Continuing... type /help or ask something else.\n"),
-          );
-          runReplLoop(rl, history, session, sessionManager);
-        },
-      );
-      return;
-    }
+      handleReplInput(trimmed, rl, history, session, sessionManager);
+    });
+  });
+}
 
-    if (trimmed === "/") {
-      printHelp();
+function handleReplInput(
+  trimmed: string,
+  rl: readline.Interface,
+  history: string[],
+  session: ChatSession,
+  sessionManager: SessionManager,
+): void {
+  if (isShellPassthrough(trimmed)) {
+    const cmd = extractShellCommand(trimmed);
+    if (!cmd) {
+      console.log(theme.warning("[SHELL MODE] Empty command"));
       runReplLoop(rl, history, session, sessionManager);
       return;
     }
+    runShellPassthrough(cmd).then(() => {
+      runReplLoop(rl, history, session, sessionManager);
+    });
+    return;
+  }
 
-    if (trimmed.startsWith("/")) {
-      if (trimmed.toLowerCase().startsWith("/delete")) {
-        const parts = trimmed.split(/\s+/);
-        const deleteArgs = parts.slice(1);
-        if (!deleteArgs[0]) {
-          console.log(st.warning("Usage: /delete <session-id>"));
-          runReplLoop(rl, history, session, sessionManager);
-          return;
-        }
-        handleDeleteCommand(deleteArgs, sessionManager, rl, () => {
-          runReplLoop(rl, history, session, sessionManager);
-        });
+  if (trimmed.toLowerCase().startsWith("/ask")) {
+    const topic = trimmed.slice(4).trim();
+    if (!topic) {
+      console.log(theme.warning("Usage: /ask <topic>"));
+      runReplLoop(rl, history, session, sessionManager);
+      return;
+    }
+    runDebateWithMentions(topic, session, sessionManager, rl, history);
+    return;
+  }
+
+  if (trimmed === "/") {
+    printHelp();
+    runReplLoop(rl, history, session, sessionManager);
+    return;
+  }
+
+  if (trimmed.startsWith("/")) {
+    if (trimmed.toLowerCase().startsWith("/delete")) {
+      const parts = trimmed.split(/\s+/);
+      const deleteArgs = parts.slice(1);
+      if (!deleteArgs[0]) {
+        console.log(theme.warning("Usage: /delete <session-id>"));
+        runReplLoop(rl, history, session, sessionManager);
         return;
       }
-
-      handleSlashCommand(trimmed, session, sessionManager, rl).then(
-        (result) => {
-          if (result === "exit") {
-            rl.close();
-            return;
-          }
-          runReplLoop(rl, history, session, sessionManager);
-        },
-      );
+      handleDeleteCommand(deleteArgs, sessionManager, rl, () => {
+        runReplLoop(rl, history, session, sessionManager);
+      });
       return;
     }
 
-    session.debate(trimmed).then(
+    handleSlashCommand(trimmed, session, sessionManager, rl).then((result) => {
+      if (result === "exit") {
+        rl.close();
+        return;
+      }
+      runReplLoop(rl, history, session, sessionManager);
+    });
+    return;
+  }
+
+  tryAttachPastedImage(trimmed, session).then((wasImage) => {
+    if (wasImage) {
+      runReplLoop(rl, history, session, sessionManager);
+      return;
+    }
+    runDebateWithMentions(trimmed, session, sessionManager, rl, history);
+  });
+}
+
+function runDebateWithMentions(
+  topic: string,
+  session: ChatSession,
+  sessionManager: SessionManager,
+  rl: readline.Interface,
+  history: string[],
+): void {
+  const parsed = parseAtMentions(topic);
+  const continueAfter = () => runReplLoop(rl, history, session, sessionManager);
+
+  buildAtMentionPrefix(parsed.mentions)
+    .then(({ injectedPrefix, injectedCount }) => {
+      if (injectedCount > 0) {
+        console.log(
+          theme.dim(`Attached ${injectedCount} file(s) from @-references.`),
+        );
+      }
+      const effective = injectedPrefix + (parsed.cleanedInput || topic);
+      return session.debate(effective);
+    })
+    .then(
       () => {
         autoSave(session, sessionManager);
-        runReplLoop(rl, history, session, sessionManager);
+        continueAfter();
       },
       (error: any) => {
-        console.error(st.error("\nDebate failed:"), error.message);
-        if (error.message.includes("503")) {
+        console.error(theme.error("\nDebate failed:"), error.message);
+        if (
+          typeof error.message === "string" &&
+          error.message.includes("503")
+        ) {
           console.log(
-            st.warning("Suggestion: Make sure the agents service is running:"),
+            theme.warning(
+              "Suggestion: Make sure the agents service is running:",
+            ),
           );
           console.log(
-            st.dim(
+            theme.dim(
               "   cd apps/agents && poetry run uvicorn src.main:app --reload --port 8000",
             ),
           );
         } else if (
-          error.message.includes("context size") ||
-          error.message.includes("Total context")
+          typeof error.message === "string" &&
+          (error.message.includes("context size") ||
+            error.message.includes("Total context"))
         ) {
           console.log(
-            st.warning(
+            theme.warning(
               "Suggestion: Try /clear to remove files, or use smaller files.",
             ),
           );
         }
         console.log(
-          st.dim("Continuing... type /help or ask something else.\n"),
+          theme.dim("Continuing... type /help or ask something else.\n"),
         );
-        runReplLoop(rl, history, session, sessionManager);
+        continueAfter();
       },
     );
-  });
 }
 
 export async function chatCommand(): Promise<void> {
@@ -447,6 +895,15 @@ export async function chatCommand(): Promise<void> {
   const contextManager = new ContextManager();
   const session = new ChatSession(client, contextManager);
   const sessionManager = new SessionManager(DEFAULT_SESSION_DIR);
+
+  const sessionStartResults = await safeRunHooks("SessionStart", {
+    sessionId: session.id ?? null,
+    cwd: process.cwd(),
+  });
+  if (shouldBlock(sessionStartResults)) {
+    console.error(theme.error("[hooks] SessionStart blocked startup"));
+    return;
+  }
 
   const spinner = ora("Checking API connection...").start();
   const isHealthy = await client.healthCheck();
@@ -464,9 +921,28 @@ export async function chatCommand(): Promise<void> {
   const baseUrl = config.apiUrl || DEFAULT_API_ORIGIN;
   try {
     const host = new URL(baseUrl).host;
-    console.log(st.dim("Ready. Connected to " + host));
+    console.log(theme.dim("Ready. Connected to " + host));
   } catch {
-    console.log(st.dim("Ready. Connected."));
+    console.log(theme.dim("Ready. Connected."));
+  }
+
+  try {
+    const projectMemory = loadMemory(process.cwd());
+    if (projectMemory && projectMemory.notes.length > 0) {
+      console.log(
+        theme.dim(
+          `Loaded ${projectMemory.notes.length} memory note(s) from this project. View with /memory.`,
+        ),
+      );
+    }
+  } catch {
+    // best-effort load; never block startup
+  }
+
+  if (vimState.enabled) {
+    console.log(
+      theme.dim("Vim mode enabled (Esc: NORMAL, i: INSERT, :q to quit)"),
+    );
   }
 
   const wsContext = await loadWorkspaceDebateContext({});
@@ -474,7 +950,7 @@ export async function chatCommand(): Promise<void> {
     session.projectFiles = wsContext.projectFiles;
     session.contextManifest = wsContext.contextManifest;
     console.log(
-      st.dim(
+      theme.dim(
         `Prepared ${wsContext.projectFiles.length} scanned project file(s) for debates.`,
       ),
     );
@@ -516,6 +992,10 @@ export async function chatCommand(): Promise<void> {
     "/rename",
     "/delete",
     "/redo",
+    "/tui",
+    "/insights",
+    "/team-onboarding",
+    "/memory",
   ];
 
   function completer(line: string): [string[], string] {
@@ -535,9 +1015,21 @@ export async function chatCommand(): Promise<void> {
     historySize: INPUT_HISTORY_SIZE,
     removeHistoryDuplicates: true,
     completer,
+    terminal: vimState.enabled ? true : undefined,
   });
+
+  installVimKeybindings(rl);
+  installModeCycleKeybinding(rl);
+
   await new Promise<void>((resolve) => {
-    rl.on("close", resolve);
+    rl.on("close", () => {
+      const tui = getTUI();
+      if (tui.isActive()) tui.leave();
+      void safeRunHooks("Stop", {
+        sessionId: session.id ?? null,
+        reason: "normal",
+      }).finally(() => resolve());
+    });
     runReplLoop(rl, history, session, sessionManager);
   });
 }
@@ -551,18 +1043,18 @@ export async function chatResumeCommand(sessionId: string): Promise<void> {
     const session = sessionManager.loadSession(sessionId);
     const displayName = session.name || sessionId;
 
-    console.log(st.success(`\nResuming session: ${displayName}\n`));
+    console.log(theme.success(`\nResuming session: ${displayName}\n`));
 
     if (session.debates.length > 0) {
-      console.log(st.bold("Conversation history:"));
+      console.log(theme.bold("Conversation history:"));
       session.debates.forEach((d, i) => {
         const topicPreview =
           d.topic.length > 60 ? d.topic.substring(0, 60) + "..." : d.topic;
-        console.log(st.brand(`  ${i + 1}.`), topicPreview);
+        console.log(theme.brand(`  ${i + 1}.`), topicPreview);
       });
       const loadedSuffix = session.debates.length === 1 ? "" : "s";
       console.log(
-        st.dim(
+        theme.dim(
           `\n  ${session.debates.length} debate${loadedSuffix} loaded. Previous syntheses will be used as context.\n`,
         ),
       );
@@ -578,10 +1070,14 @@ export async function chatResumeCommand(sessionId: string): Promise<void> {
       history,
       historySize: INPUT_HISTORY_SIZE,
       removeHistoryDuplicates: true,
+      terminal: vimState.enabled ? true : undefined,
     });
+
+    installVimKeybindings(rl);
+    installModeCycleKeybinding(rl);
     runReplLoop(rl, history, session, sessionManager);
   } catch (error: any) {
-    console.error(st.error("Failed to load session:"), error.message);
+    console.error(theme.error("Failed to load session:"), error.message);
     process.exit(1);
   }
 }

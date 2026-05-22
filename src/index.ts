@@ -20,6 +20,9 @@ import {
 import { chatCommand, chatResumeCommand } from "./commands/chat.js";
 import { loginCommand } from "./commands/login.js";
 import { logoutCommand } from "./commands/logout.js";
+import { setupTokenCommand } from "./commands/setup-token.js";
+import { menuCommand } from "./commands/menu.js";
+import { voiceCommand } from "./commands/voice.js";
 import { debugCommand } from "./commands/debug.js";
 import { logsCommand } from "./commands/logs.js";
 import { statsCommand } from "./commands/stats.js";
@@ -32,6 +35,7 @@ import {
 import { upgradeCommand } from "./commands/upgrade.js";
 import { mcpCommand } from "./commands/mcp.js";
 import { modelsCommand } from "./commands/models.js";
+import { completionsCommand } from "./commands/completions.js";
 import {
   addServerCommand,
   listServersCommand,
@@ -40,11 +44,32 @@ import {
   toolsCommand,
 } from "./commands/mcp-servers.js";
 import {
+  browseCommand as mcpBrowseCommand,
+  installCommand as mcpInstallCommand,
+  searchCommand as mcpSearchCommand,
+  uninstallCommand as mcpUninstallCommand,
+} from "./commands/mcp-marketplace.js";
+import {
   listDebatesCommand,
   cancelDebateCommand,
   startDebateCommand,
   streamDebateCommand,
 } from "./commands/debates.js";
+import { registerAgentsCommand } from "./commands/agents.js";
+import {
+  schedulerRunDaemonCommand,
+  schedulerStartCommand,
+  schedulerStatusCommand,
+  schedulerStopCommand,
+  schedulerTailCommand,
+} from "./commands/scheduler.js";
+import {
+  linearCreateCommand,
+  linearDebateCommand,
+  linearListCommand,
+  linearUpdateCommand,
+  linearViewCommand,
+} from "./commands/linear.js";
 import { SessionManager } from "./utils/session-manager.js";
 import { style } from "./utils/visual-system.js";
 
@@ -52,6 +77,7 @@ const st = style();
 const KNOWN_SUBCOMMANDS = [
   "debate",
   "debates",
+  "agents",
   "ask",
   "chat",
   "config",
@@ -71,6 +97,14 @@ const KNOWN_SUBCOMMANDS = [
   "debate-failing",
   "debate-staged",
   "upgrade",
+  "setup-token",
+  "share",
+  "scheduler",
+  "voice",
+  "linear",
+  "sub-agents",
+  "sub-agent",
+  "completions",
   "help",
 ];
 const args = process.argv.slice(2);
@@ -86,14 +120,13 @@ const isOneShot =
 async function main(): Promise<void> {
   if (isDefaultRepl) {
     const { isLoggedIn } = await import("./utils/config.js");
-    const { runRepl } = await import("./repl/index.js");
     if (isLoggedIn()) {
-      await runRepl();
+      await menuCommand();
     } else {
       const { loginFlow } = await import("./commands/login.js");
       const ok = await loginFlow();
       if (ok) {
-        await runRepl();
+        await menuCommand();
       }
     }
     return;
@@ -145,6 +178,44 @@ async function main(): Promise<void> {
       "--file <paths...>",
       "Files to attach as context (e.g., --file src/auth.ts diagram.png)",
     )
+    .option(
+      "--plan",
+      "Plan mode: emit a written plan for approval before any write",
+    )
+    .option(
+      "--output-format <fmt>",
+      "Output format: text|json|stream-json (default: text)",
+    )
+    .option(
+      "--json-schema <path>",
+      "Validate final synthesis against the given JSON Schema file; print as JSON",
+    )
+    .option(
+      "--max-budget-usd <n>",
+      "Abort if running cost estimate exceeds this many USD",
+    )
+    .option(
+      "--max-turns <n>",
+      "Cap the debate at N rounds (overrides mode default)",
+    )
+    .option(
+      "-b, --bg",
+      "Run the debate as a detached background agent (returns immediately)",
+    )
+    .option(
+      "--generate-image",
+      "Generate an image from the debate synthesis using the agents image-gen tool",
+    )
+    .option(
+      "--image-prompt-from <src>",
+      "Source of image prompt: 'synthesis' (default) or 'topic'",
+      "synthesis",
+    )
+    .option(
+      "--image-size <size>",
+      "Image size for --generate-image (default 1024x1024)",
+      "1024x1024",
+    )
     .action(debateCommand);
 
   program
@@ -178,6 +249,10 @@ async function main(): Promise<void> {
     .option(
       "--file <paths...>",
       "Files to attach as context (e.g., --file src/auth.ts diagram.png)",
+    )
+    .option(
+      "--plan",
+      "Plan mode: emit a written plan for approval before any write",
     )
     .action(debateCommand);
 
@@ -226,6 +301,20 @@ async function main(): Promise<void> {
     .command("logout")
     .description("Sign out and clear stored credentials")
     .action(logoutCommand);
+
+  program
+    .command("setup-token")
+    .description("Generate a long-lived CI token (default 365 days)")
+    .option("-n, --name <name>", 'Token label (e.g. "github-actions")')
+    .option("-d, --days <n>", "Token lifetime in days", "365")
+    .option("--print", "Print only the token (for scripting)")
+    .action((options: { name?: string; days?: string; print?: boolean }) =>
+      setupTokenCommand({
+        name: options.name,
+        days: options.days,
+        print: options.print,
+      }),
+    );
 
   program
     .command("debug")
@@ -305,6 +394,38 @@ async function main(): Promise<void> {
     .option("--check", "Only check for a newer version, do not install")
     .action((options: { check?: boolean }) => upgradeCommand(options));
 
+  program
+    .command("voice")
+    .description(
+      "Record audio, transcribe via Whisper, optionally start a debate",
+    )
+    .option("--once", "Record one clip, print transcript, exit")
+    .option("-l, --language <lang>", "BCP-47 language code", "en")
+    .option("--debate", "Pipe transcript into a debate")
+    .option("-m, --mode <mode>", "Debate mode (with --debate)", "council")
+    .option(
+      "--max-seconds <n>",
+      "Maximum recording length in seconds (default 30)",
+    )
+    .action(
+      (options: {
+        once?: boolean;
+        language?: string;
+        debate?: boolean;
+        mode?: string;
+        maxSeconds?: string;
+      }) =>
+        voiceCommand({
+          once: options.once,
+          language: options.language,
+          debate: options.debate,
+          mode: options.mode,
+          maxSeconds: options.maxSeconds
+            ? Number(options.maxSeconds)
+            : undefined,
+        }),
+    );
+
   const mcp = program
     .command("mcp")
     .description(
@@ -367,6 +488,43 @@ async function main(): Promise<void> {
     .option("--json", "Emit as JSON")
     .action((opts: { json?: boolean }) => toolsCommand(opts));
 
+  mcp
+    .command("browse")
+    .description("Browse the curated MCP server marketplace")
+    .option("--json", "Emit as JSON")
+    .action((opts: { json?: boolean }) => mcpBrowseCommand(opts));
+
+  mcp
+    .command("search <query>")
+    .description(
+      "Search the MCP server marketplace by name, tag, or description",
+    )
+    .option("--json", "Emit as JSON")
+    .action((query: string, opts: { json?: boolean }) =>
+      mcpSearchCommand(query, opts),
+    );
+
+  mcp
+    .command("install <name>")
+    .description(
+      "Install a marketplace MCP server (npm install -g + add to config)",
+    )
+    .option("--json", "Emit as JSON")
+    .action((name: string, opts: { json?: boolean }) =>
+      mcpInstallCommand(name, opts),
+    );
+
+  mcp
+    .command("uninstall <name>")
+    .description(
+      "Remove an MCP server from config and npm-uninstall its package",
+    )
+    .option("--json", "Emit as JSON")
+    .option("--keep-package", "Remove only the config entry; leave npm package")
+    .action((name: string, opts: { json?: boolean; keepPackage?: boolean }) =>
+      mcpUninstallCommand(name, opts),
+    );
+
   program
     .command("models")
     .description("Show default models, full catalog, and deprecation status")
@@ -421,6 +579,40 @@ async function main(): Promise<void> {
       "Don't expose Read/Edit/Grep/Bash tools or MCP server tools to the council",
     )
     .action(startDebateCommand);
+
+  registerAgentsCommand(program);
+
+  const scheduler = program
+    .command("scheduler")
+    .description(
+      "Standalone daemon that fires persisted /loop and /schedule registrations",
+    );
+
+  scheduler
+    .command("start")
+    .description("Start the scheduler daemon (detached background process)")
+    .action(() => schedulerStartCommand());
+
+  scheduler
+    .command("stop")
+    .description("Stop the running scheduler daemon")
+    .action(() => schedulerStopCommand());
+
+  scheduler
+    .command("status")
+    .description("Show scheduler running state and active loop/schedule counts")
+    .action(() => schedulerStatusCommand());
+
+  scheduler
+    .command("tail")
+    .description("Print the scheduler log")
+    .option("-f, --follow", "Follow the log (like tail -f)")
+    .action((opts: { follow?: boolean }) => schedulerTailCommand(opts));
+
+  scheduler
+    .command("__run__", { hidden: true })
+    .description("Internal: run the scheduler loop in this process")
+    .action(() => schedulerRunDaemonCommand());
 
   debates
     .command("stream")
@@ -543,6 +735,141 @@ async function main(): Promise<void> {
     .command("list")
     .description("List all configuration")
     .action(configListCommand);
+
+  // === W10: share scaffold ===
+  const { shareCommand } = await import("./commands/share.js");
+  program
+    .command("share <sessionId>")
+    .description(
+      "Share a saved session (POSTs to backend; falls back to local JSON export)",
+    )
+    .option(
+      "--public",
+      "Make the shared session publicly readable (default: link-only)",
+    )
+    .action((sessionId: string, opts: { public?: boolean }) =>
+      shareCommand(sessionId, opts),
+    );
+
+  const { subAgentsListCommand, subAgentsRunCommand } =
+    await import("./commands/sub-agents.js");
+  const subAgentsCmd = program
+    .command("sub-agents")
+    .description("Manage user-defined sub-agents from ~/.consilium/agents/");
+  subAgentsCmd
+    .command("list")
+    .description("List available sub-agents")
+    .action(() => subAgentsListCommand());
+  program
+    .command("sub-agent <name> <prompt>")
+    .description("Invoke a user-defined sub-agent with a prompt")
+    .action((name: string, prompt: string) =>
+      subAgentsRunCommand(name, prompt),
+    );
+
+  program
+    .command("completions <shell>")
+    .description("Print shell completion script (bash|zsh|fish)")
+    .action((shell: string) => completionsCommand(shell));
+
+  const linear = program
+    .command("linear")
+    .description("Manage Linear (MYC-) issues from the CLI");
+
+  linear
+    .command("list")
+    .description("List Linear issues for the MYC team")
+    .option("--mine", "Only list issues assigned to you")
+    .option(
+      "--state <state>",
+      "Filter by workflow state name (e.g. Todo, Done)",
+    )
+    .option("--team <key>", "Linear team key (default: MYC)")
+    .action((opts: { mine?: boolean; state?: string; team?: string }) =>
+      linearListCommand(opts),
+    );
+
+  linear
+    .command("view <id>")
+    .description("Show one Linear issue (description, comments, state, labels)")
+    .option("--team <key>", "Linear team key (default: MYC)")
+    .action((id: string, opts: { team?: string }) =>
+      linearViewCommand(id, opts),
+    );
+
+  linear
+    .command("create <title>")
+    .description("Create a new Linear issue in the MYC team")
+    .option("--description <text>", "Issue description (markdown)")
+    .option("--label <label>", "Label name to apply")
+    .option("--assignee <email>", "Assignee email")
+    .option("--team <key>", "Linear team key (default: MYC)")
+    .action(
+      (
+        title: string,
+        opts: {
+          description?: string;
+          label?: string;
+          assignee?: string;
+          team?: string;
+        },
+      ) => linearCreateCommand(title, opts),
+    );
+
+  linear
+    .command("update <id>")
+    .description(
+      "Update a Linear issue's state, description, label, or assignee",
+    )
+    .option("--state <state>", "Workflow state name (e.g. In Progress, Done)")
+    .option("--description <text>", "Replace the issue description")
+    .option("--label <label>", "Replace labels with this single label")
+    .option("--assignee <email>", "Reassign to this user (by email)")
+    .option("--team <key>", "Linear team key (default: MYC)")
+    .action(
+      (
+        id: string,
+        opts: {
+          state?: string;
+          description?: string;
+          label?: string;
+          assignee?: string;
+          team?: string;
+        },
+      ) => linearUpdateCommand(id, opts),
+    );
+
+  linear
+    .command("debate <id>")
+    .description(
+      "Fetch a Linear issue and run a debate using its title + description as the topic",
+    )
+    .option("--mode <mode>", "Debate mode (default: council)")
+    .option(
+      "--post-comment",
+      "Post the synthesis back as a comment on the issue (placeholder, requires SSE wiring)",
+    )
+    .option("-m, --models <models...>", "Models to use")
+    .option("--team <key>", "Linear team key (default: MYC)")
+    .action(
+      (
+        id: string,
+        opts: {
+          mode?: string;
+          postComment?: boolean;
+          models?: string[];
+          team?: string;
+        },
+      ) =>
+        linearDebateCommand(id, {
+          ...(opts.mode !== undefined && { mode: opts.mode }),
+          ...(opts.postComment !== undefined && {
+            postComment: opts.postComment,
+          }),
+          ...(opts.models !== undefined && { models: opts.models }),
+          ...(opts.team !== undefined && { team: opts.team }),
+        }),
+    );
 
   program.parse();
 }

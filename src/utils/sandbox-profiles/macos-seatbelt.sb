@@ -1,0 +1,12 @@
+(version 1)
+(deny default)
+(allow process-exec)
+(allow process-fork)
+(allow signal (target self))
+(allow file-read* (subpath "/usr"))
+(allow file-read* (subpath "/System"))
+(allow file-read* (subpath "/Library"))
+(allow file-read* (subpath "/private/etc"))
+{{ALLOW_READ}}
+{{ALLOW_WRITE}}
+{{ALLOW_NETWORK}}

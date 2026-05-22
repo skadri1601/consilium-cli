@@ -128,13 +128,21 @@ async function callLLMForExtraction(
 
   let fullText = "";
   const streamUrl = `${apiUrl}/api/v1/debates/${id}/stream`;
-  const EventSourceModule = await import("eventsource");
-  const EventSource = EventSourceModule.default;
+  const { EventSource } = await import("eventsource");
 
-  const init: { headers?: Record<string, string> } = {};
-  if (config.apiKey) {
-    init.headers = { Authorization: `Bearer ${config.apiKey}` };
-  }
+  type EventSourceInitArg = ConstructorParameters<typeof EventSource>[1];
+  const init: EventSourceInitArg = config.apiKey
+    ? {
+        fetch: (url, fetchInit) =>
+          fetch(url, {
+            ...fetchInit,
+            headers: {
+              ...fetchInit.headers,
+              Authorization: `Bearer ${config.apiKey}`,
+            },
+          }),
+      }
+    : undefined;
 
   await new Promise<void>((resolve, reject) => {
     const es = new EventSource(streamUrl, init);

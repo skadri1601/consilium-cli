@@ -31,6 +31,11 @@ import {
 import { applyEdits, parseEditsFromSynthesis } from "../utils/apply-edits";
 import { formatEditPreview } from "../utils/diff-preview";
 import {
+  generateImage,
+  ImageGenError,
+  type ImageSize,
+} from "../utils/image-gen-client";
+import {
   consumeWritePermission,
   requestWritePermission,
 } from "../utils/codebase-permissions";
@@ -42,6 +47,29 @@ import {
   startToolBridge,
   type ToolBridgeHandle,
 } from "../utils/mcp-tool-bridge";
+import {
+  clearPlan,
+  enterPlanMode,
+  exitPlanMode,
+  getPlan,
+  isPlanModeActive,
+  promptApproval,
+  recordPlanStep,
+  renderPlan,
+} from "../utils/plan-mode";
+import { createWorktree } from "../utils/worktree";
+import { isSandboxAvailable } from "../utils/sandbox-stub";
+import { detectSandboxCapabilities } from "../utils/sandbox-native";
+import {
+  emitFinalJson,
+  emitStreamEvent,
+  isHeadlessFormat,
+  isValidOutputFormatFlag,
+  type OutputFormat as HeadlessOutputFormat,
+  validateAgainstSchema,
+} from "../utils/output-formats";
+import { BudgetGuard } from "../utils/budget-guard";
+import { spawnDetached } from "../utils/agent-supervisor";
 
 const st = style();
 
@@ -80,6 +108,107 @@ export interface DebateCommandOptions {
   file?: string[];
   /** Commander negation: present and false when --no-tools is passed. Default ON. */
   tools?: boolean;
+  /** Plan mode: read-only deliberation that prints a plan + asks for approval. */
+  plan?: boolean;
+  /** Output format for headless / scripting use: text | json | stream-json. */
+  outputFormat?: string;
+  /** Path to a JSON Schema file. Final synthesis is validated against it. */
+  jsonSchema?: string;
+  /** Abort the debate if the running cost estimate exceeds this many USD. */
+  maxBudgetUsd?: string;
+  /** Cap the debate at N rounds (overrides mode default). */
+  maxTurns?: string;
+  worktree?: string | boolean;
+  sandbox?: boolean;
+  /** When set with --sandbox, do NOT abort if the native sandbox is unavailable. */
+  noSandboxStrict?: boolean;
+  /** Run as a detached background agent and exit immediately. */
+  bg?: boolean;
+  /** Generate an illustration from the final synthesis. */
+  generateImage?: boolean;
+  /** Source of the image prompt: 'synthesis' (default) or 'topic'. */
+  imagePromptFrom?: string;
+  /** Image size, e.g. 1024x1024. */
+  imageSize?: string;
+}
+
+const VALID_IMAGE_SIZES: ReadonlySet<ImageSize> = new Set<ImageSize>([
+  "256x256",
+  "512x512",
+  "1024x1024",
+  "1792x1024",
+  "1024x1792",
+]);
+
+function isValidImageSize(value: string): value is ImageSize {
+  return VALID_IMAGE_SIZES.has(value as ImageSize);
+}
+
+function buildImagePrompt(
+  source: string,
+  topic: string,
+  synthesis: string,
+): string {
+  if (source === "topic") {
+    return `Render an illustration of: ${topic.trim()}`;
+  }
+  const text = (synthesis || topic).trim().replace(/\s+/g, " ");
+  const truncated = text.length > 500 ? text.slice(0, 500) : text;
+  return `Illustrate the key idea of: ${truncated}`;
+}
+
+async function maybeGenerateDebateImage(
+  options: DebateCommandOptions,
+  topic: string,
+  synthesis: string,
+): Promise<void> {
+  if (!options.generateImage) return;
+  const source = (options.imagePromptFrom ?? "synthesis").toLowerCase();
+  const size = options.imageSize ?? "1024x1024";
+  const prompt = buildImagePrompt(source, topic, synthesis);
+  if (!prompt.trim()) {
+    console.log(st.warning("No content available to build image prompt."));
+    return;
+  }
+  if (!isValidImageSize(size)) {
+    console.log(
+      st.warning(`Invalid --image-size "${size}". Falling back to 1024x1024.`),
+    );
+  }
+  const resolvedSize: ImageSize = isValidImageSize(size) ? size : "1024x1024";
+  console.log(st.dim("\n  Generating image..."));
+  try {
+    const result = await generateImage({
+      prompt,
+      size: resolvedSize,
+    });
+    console.log(st.success(`  Image saved: ${result.filePath}`));
+    if (result.revisedPrompt) {
+      console.log(st.dim(`  Revised prompt: ${result.revisedPrompt}`));
+    }
+    if (typeof result.costUsd === "number") {
+      console.log(st.dim(`  Image cost: $${result.costUsd.toFixed(4)}`));
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const providerLabel =
+      err instanceof ImageGenError ? ` [${err.provider}]` : "";
+    console.log(
+      st.warning(`  Image generation failed${providerLabel}: ${msg}`),
+    );
+  }
+}
+
+function parsePositiveNumber(raw: string | undefined): number | undefined {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return undefined;
+  return n;
+}
+
+function resolveHeadlessFormat(raw: string | undefined): HeadlessOutputFormat {
+  if (raw && isValidOutputFormatFlag(raw)) return raw;
+  return "text";
 }
 
 const STEP_LABELS: Record<string, string> = {
@@ -448,6 +577,8 @@ function writeFormattedDebateOutput(
 interface ClassicDebateFlowOptions {
   tools?: boolean;
   wsContext?: WorkspaceDebateContext | null;
+  headlessFormat?: HeadlessOutputFormat;
+  budgetGuard?: BudgetGuard;
 }
 
 async function runClassicDebateFlow(
@@ -460,11 +591,16 @@ async function runClassicDebateFlow(
   options?: ClassicDebateFlowOptions,
 ): Promise<string> {
   const wsContext = options?.wsContext;
+  const headlessFormat = options?.headlessFormat ?? "text";
+  const headless = isHeadlessFormat(headlessFormat);
+  const streamJson = headlessFormat === "stream-json";
+  const budgetGuard = options?.budgetGuard;
+  const liveProgress = useLiveProgress && !headless;
   const stepIds: string[] = ["health", "createDebate", "startStream"];
   const tracker = createStepTracker(stepIds, STEP_LABELS);
 
   const renderProgress = () => {
-    if (useLiveProgress) {
+    if (liveProgress) {
       logUpdate(tracker.render("Initializing"));
     }
   };
@@ -474,8 +610,18 @@ async function runClassicDebateFlow(
   const isHealthy = await client.healthCheck();
 
   if (!isHealthy) {
-    if (useLiveProgress) logUpdate.clear();
-    console.log(st.error("API is not available"));
+    if (liveProgress) logUpdate.clear();
+    if (headless) {
+      emitFinalJson({
+        ok: false,
+        error: "API is not available",
+        topic,
+        mode,
+        models,
+      });
+    } else {
+      console.log(st.error("API is not available"));
+    }
     process.exit(1);
   }
 
@@ -483,21 +629,23 @@ async function runClassicDebateFlow(
   tracker.start("createDebate");
   renderProgress();
 
-  // Start the agent toolkit bridge by default (--no-tools opts out).
-  // Vision: Consilium debates the codebase; making file/grep/edit tools
-  // opt-in meant most debates ran blind.
   const toolsEnabled = options?.tools !== false;
   let bridge: ToolBridgeHandle | null = null;
   if (toolsEnabled) {
     try {
-      bridge = await startToolBridge(client, { enabled: true, quiet: false });
+      bridge = await startToolBridge(client, {
+        enabled: true,
+        quiet: headless,
+      });
     } catch (err) {
-      // Bridge startup failure is non-fatal - fall through to a tool-less debate
-      // so the user still gets an answer instead of a hard exit.
-      console.log(
-        st.warning(`  Could not start tool bridge: ${(err as Error).message}`),
-      );
-      console.log(st.dim("  Continuing without agent file tools."));
+      if (!headless) {
+        console.log(
+          st.warning(
+            `  Could not start tool bridge: ${(err as Error).message}`,
+          ),
+        );
+        console.log(st.dim("  Continuing without agent file tools."));
+      }
     }
   }
 
@@ -523,6 +671,12 @@ async function runClassicDebateFlow(
       debateOpts.projectFiles = wsContext.projectFiles;
       debateOpts.projectContext = wsContext.projectContext;
     }
+    if (isPlanModeActive()) {
+      debateOpts.projectContext = {
+        ...(debateOpts.projectContext ?? {}),
+        planMode: true,
+      };
+    }
     if (bridge) {
       debateOpts.tools = bridge.tools;
       debateOpts.toolBudget = bridge.toolBudget;
@@ -533,13 +687,24 @@ async function runClassicDebateFlow(
       "createDebate",
       err instanceof Error ? err.message : "Create failed",
     );
-    if (useLiveProgress) logUpdate.clear();
+    if (liveProgress) logUpdate.clear();
+    const errMsg = err instanceof Error ? err.message : "Create failed";
     log("ERROR", "debate_failed", {
-      error: err instanceof Error ? err.message : "Create failed",
+      error: errMsg,
       durationMs: Date.now() - debateStartTime,
     });
-    console.log(st.error("Debate creation failed"));
-    console.error(st.error((err as Error).message));
+    if (headless) {
+      emitFinalJson({
+        ok: false,
+        error: "Debate creation failed: " + errMsg,
+        topic,
+        mode,
+        models,
+      });
+    } else {
+      console.log(st.error("Debate creation failed"));
+      console.error(st.error((err as Error).message));
+    }
     process.exit(1);
   }
 
@@ -553,7 +718,9 @@ async function runClassicDebateFlow(
   renderProgress();
 
   let goldenPrompt = "";
-  const handleEvent = createStreamHandlers({ topic });
+  const handleEvent = headless ? null : createStreamHandlers({ topic, models });
+  let aborted = false;
+  let abortReason: string | undefined;
 
   const sigintHandler = async () => {
     try {
@@ -568,36 +735,83 @@ async function runClassicDebateFlow(
   };
   process.on("SIGINT", sigintHandler);
 
+  async function maybeAbort(): Promise<boolean> {
+    if (!budgetGuard) return false;
+    const decision = budgetGuard.shouldAbort();
+    if (!decision.abort || aborted) return aborted;
+    aborted = true;
+    abortReason = decision.reason;
+    try {
+      await client.cancelDebate(debate.id);
+    } catch (err) {
+      log("WARN", "debate_cancel_failed", {
+        debateId: debate.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return true;
+  }
+
   try {
     await client.streamDebate(debate.id, (event: DebateEvent) => {
       if (event.type === "debate_start") {
         tracker.complete("startStream");
-        if (useLiveProgress) logUpdate.clear();
+        if (liveProgress) logUpdate.clear();
+      }
+      if (event.type === "agent_complete") {
+        budgetGuard?.recordTurn();
       }
       if (event.type === "consensus" && event.text) goldenPrompt = event.text;
-      // Route tool:call_request events to the bridge so the agents'
-      // Read/Edit/Grep/etc. calls are answered locally. Fire-and-forget;
-      // the bridge handles its own errors and posts results back to the
-      // engine via postToolResult.
       if (bridge && event.type === "tool:call_request") {
         bridge.handleEvent(event, debate.id).catch((err) => {
           const msg = err instanceof Error ? err.message : String(err);
-          console.error(st.warning(`[mcp] tool dispatch failed: ${msg}`));
+          if (!headless) {
+            console.error(st.warning(`[mcp] tool dispatch failed: ${msg}`));
+          }
         });
       }
-      handleEvent(event);
+      if (streamJson) {
+        emitStreamEvent({ type: event.type, data: event, ts: Date.now() });
+      } else if (handleEvent) {
+        handleEvent(event);
+      }
+      if (budgetGuard && !aborted) {
+        const decision = budgetGuard.shouldAbort();
+        if (decision.abort) {
+          void maybeAbort();
+        }
+      }
     });
   } catch (error: unknown) {
-    if (useLiveProgress) logUpdate.clear();
+    if (liveProgress) logUpdate.clear();
     const msg = error instanceof Error ? error.message : "Unknown error";
-    log("ERROR", "debate_failed", {
-      debateId: debate.id,
-      error: msg,
-      durationMs: Date.now() - debateStartTime,
-    });
-    console.log(st.error("\n  Error: " + msg + "\n"));
-    logStreamFailureHints(error);
-    process.exit(1);
+    if (aborted) {
+      log("INFO", "debate_aborted", {
+        debateId: debate.id,
+        data: { reason: abortReason },
+        durationMs: Date.now() - debateStartTime,
+      });
+    } else {
+      log("ERROR", "debate_failed", {
+        debateId: debate.id,
+        error: msg,
+        durationMs: Date.now() - debateStartTime,
+      });
+      if (headless) {
+        emitFinalJson({
+          ok: false,
+          error: msg,
+          topic,
+          mode,
+          models,
+          debateId: debate.id,
+        });
+      } else {
+        console.log(st.error("\n  Error: " + msg + "\n"));
+        logStreamFailureHints(error);
+      }
+      process.exit(1);
+    }
   } finally {
     process.removeListener("SIGINT", sigintHandler);
     if (bridge) {
@@ -614,6 +828,28 @@ async function runClassicDebateFlow(
 
   writeDebateMemory(wsContext, topic, mode, goldenPrompt, debate.id);
 
+  if (headless) {
+    const payload: Record<string, unknown> = {
+      ok: !aborted,
+      synthesis: goldenPrompt,
+      debateId: debate.id,
+      topic,
+      mode,
+      models,
+      budget: budgetGuard?.summary(),
+    };
+    if (aborted) {
+      payload["aborted"] = true;
+      payload["abortReason"] = abortReason;
+    }
+    if (streamJson) {
+      emitStreamEvent({ type: "complete", data: payload, ts: Date.now() });
+    } else {
+      emitFinalJson(payload);
+    }
+    return goldenPrompt;
+  }
+
   writeFormattedDebateOutput(
     goldenPrompt,
     outputFormat,
@@ -623,7 +859,13 @@ async function runClassicDebateFlow(
     debate.id,
   );
 
-  console.log(st.success("Debate complete.\n"));
+  if (aborted) {
+    console.log(
+      st.warning(`Debate aborted: ${abortReason ?? "limit reached"}`),
+    );
+  } else {
+    console.log(st.success("Debate complete.\n"));
+  }
   return goldenPrompt;
 }
 
@@ -706,10 +948,67 @@ export async function loadWorkspaceContext(
   };
 }
 
+function buildDebateBackgroundArgs(
+  topic: string,
+  options: DebateCommandOptions,
+): string[] {
+  const args: string[] = [topic];
+  if (options.mode) args.push("--mode", options.mode);
+  if (options.models && options.models.length > 0) {
+    args.push("--models", ...options.models);
+  }
+  if (options.output) args.push("--output", options.output);
+  if (options.outputFormat) args.push("--output-format", options.outputFormat);
+  if (options.jsonSchema) args.push("--json-schema", options.jsonSchema);
+  if (options.maxBudgetUsd) args.push("--max-budget-usd", options.maxBudgetUsd);
+  if (options.maxTurns) args.push("--max-turns", options.maxTurns);
+  if (options.ticket) args.push("--ticket", options.ticket);
+  if (options.file && options.file.length > 0) {
+    args.push("--file", ...options.file);
+  }
+  if (options.gitDiff) args.push("--git-diff");
+  if (options.git === false) args.push("--no-git");
+  if (options.tools === false) args.push("--no-tools");
+  if (options.context === false) args.push("--no-context");
+  if (options.apply) args.push("--apply");
+  if (options.plan) args.push("--plan");
+  return args;
+}
+
+async function runDebateInBackground(
+  topic: string,
+  options: DebateCommandOptions,
+): Promise<void> {
+  const args = buildDebateBackgroundArgs(topic, options);
+  try {
+    const record = await spawnDetached({ command: "debate", args });
+    console.log(st.success("Debate started in background."));
+    console.log(st.dim(`  id:   ${record.id}`));
+    console.log(st.dim(`  pid:  ${record.pid}`));
+    console.log(st.dim(`  log:  ${record.logPath}`));
+    console.log("");
+    console.log(st.brand("  Attach:"));
+    console.log(st.dim(`    consilium agents attach ${record.id}`));
+    console.log(st.dim(`    consilium agents logs ${record.id} -f`));
+    console.log(st.dim(`    consilium agents stop ${record.id}`));
+    console.log("");
+  } catch (err) {
+    console.error(
+      st.error(`Failed to start background debate: ${(err as Error).message}`),
+    );
+    process.exit(1);
+  }
+}
+
 export async function debateCommand(
   topic: string,
   options: DebateCommandOptions,
 ): Promise<void> {
+  if (options.bg && process.env["CONSILIUM_BG_AGENT"] !== "1") {
+    await runDebateInBackground(topic, options);
+    return;
+  }
+
   await requireAuth();
 
   const mode: DebateMode =
@@ -719,38 +1018,195 @@ export async function debateCommand(
       ? options.output
       : "text";
 
-  warnDebateCommandOptions(options, mode, outputFormat);
+  const headlessFormat = resolveHeadlessFormat(options.outputFormat);
+  const headless = isHeadlessFormat(headlessFormat);
+  const maxBudgetUsd = parsePositiveNumber(options.maxBudgetUsd);
+  const maxTurns = parsePositiveNumber(options.maxTurns);
+  const budgetGuard =
+    maxBudgetUsd !== undefined || maxTurns !== undefined
+      ? new BudgetGuard(maxBudgetUsd, maxTurns)
+      : undefined;
+
+  if (!headless) {
+    warnDebateCommandOptions(options, mode, outputFormat);
+  }
+
+  if (options.sandbox) {
+    const caps = detectSandboxCapabilities();
+    if (caps.available) {
+      process.env["CONSILIUM_SANDBOX_MODE"] = "1";
+      process.env["CONSILIUM_SANDBOX_MECHANISM"] = caps.mechanism;
+      process.env["CONSILIUM_SANDBOX_PLATFORM"] = caps.platform;
+      if (!headless) {
+        console.log(
+          st.dim(
+            `[SANDBOX] Native sandboxing active (platform: ${caps.platform}, mechanism: ${caps.mechanism}).`,
+          ),
+        );
+      }
+    } else {
+      const availability = isSandboxAvailable();
+      const reason =
+        caps.reason ?? availability.reason ?? "Sandbox unavailable.";
+      if (!headless) {
+        console.log(st.warning(`[SANDBOX] ${reason}`));
+      }
+      if (!options.noSandboxStrict) {
+        if (headless) {
+          process.stderr.write(`[SANDBOX] ${reason}\n`);
+        } else {
+          console.log(
+            st.dim(
+              "Pass --no-sandbox-strict to continue without native sandboxing, or use --worktree for git-level isolation.",
+            ),
+          );
+        }
+        process.exit(1);
+      }
+    }
+  }
+
+  if (options.worktree) {
+    const branch =
+      typeof options.worktree === "string" && options.worktree.length > 0
+        ? options.worktree
+        : undefined;
+    try {
+      const ref = await createWorktree(branch);
+      if (!headless) {
+        console.log(
+          st.success(`Created worktree at ${ref.path} on branch ${ref.branch}`),
+        );
+      }
+      process.chdir(ref.path);
+    } catch (err) {
+      if (!headless) {
+        console.log(
+          st.warning(
+            `--worktree failed: ${(err as Error).message}. Continuing in current directory.`,
+          ),
+        );
+      }
+    }
+  }
+
+  if (options.plan && !headless) {
+    enterPlanMode();
+    console.log(
+      st.brand(
+        "Entering plan mode - no write tools will execute until you approve.",
+      ),
+    );
+  }
 
   const prefs = await getPreferences();
   const models = options.models || prefs.defaultAgents;
-  const estimate = estimateCost(mode, models.length);
-  console.log(st.dim(formatCostEstimate(estimate)));
-
-  maybePrintFreeTierNotice(models);
+  if (!headless) {
+    const estimate = estimateCost(mode, models.length);
+    console.log(st.dim(formatCostEstimate(estimate)));
+    maybePrintFreeTierNotice(models);
+  }
 
   const wsContext = await loadWorkspaceContext(options);
 
   const client = new ConsiliumClient();
   const useLiveProgress = terminal.isTTY && !terminal.usePlain;
+  const useDeliberation = ["redteam", "jury", "market"].includes(mode);
   let synthesis = "";
-  synthesis = await runClassicDebateFlow(
-    client,
-    topic,
-    mode,
-    models,
-    outputFormat,
-    useLiveProgress,
-    { ...options, wsContext },
-  );
+  let currentTopic = topic;
+  if (useDeliberation) {
+    synthesis = await runDeliberation(
+      client,
+      currentTopic,
+      mode,
+      models,
+      outputFormat,
+      useLiveProgress,
+      wsContext,
+      { headlessFormat, budgetGuard },
+    );
+  } else {
+    synthesis = await runClassicDebateFlow(
+      client,
+      currentTopic,
+      mode,
+      models,
+      outputFormat,
+      useLiveProgress,
+      { ...options, wsContext, headlessFormat, budgetGuard },
+    );
+  }
 
-  if (options.apply) {
+  if (options.jsonSchema) {
+    const result = validateAgainstSchema(
+      parseSynthesisForSchema(synthesis),
+      options.jsonSchema,
+    );
+    if (!result.ok) {
+      const lines = ["Schema validation failed:"];
+      for (const e of result.errors ?? []) lines.push("  - " + e);
+      process.stderr.write(lines.join("\n") + "\n");
+      process.exit(2);
+    }
+  }
+
+  if (options.plan && !headless) {
+    let refining = true;
+    while (refining) {
+      refining = false;
+      extractPlanSteps(synthesis);
+      console.log("\n" + renderPlan() + "\n");
+      const decision = await promptApproval();
+      if (decision === "approve") {
+        exitPlanMode();
+        console.log(
+          st.success(
+            "Plan approved. Re-run without --plan to execute, or use `/plan` then continue.",
+          ),
+        );
+        return;
+      }
+      if (decision === "refine") {
+        const refinement = await promptRefinement();
+        if (!refinement) {
+          clearPlan();
+          exitPlanMode();
+          console.log(st.dim("Plan refinement cancelled."));
+          return;
+        }
+        clearPlan();
+        currentTopic = `Refinement: ${refinement}\n\nOriginal topic: ${topic}`;
+        synthesis = await runClassicDebateFlow(
+          client,
+          currentTopic,
+          mode,
+          models,
+          outputFormat,
+          useLiveProgress,
+          { ...options, wsContext, headlessFormat, budgetGuard },
+        );
+        refining = true;
+        continue;
+      }
+      clearPlan();
+      exitPlanMode();
+      console.log(st.warning("Plan cancelled."));
+      return;
+    }
+  }
+
+  if (options.apply && !headless) {
     await maybeApplySynthesisEdits(
       synthesis,
       wsContext?.rootPath || resolveProjectRoot(process.cwd()).root,
     );
   }
 
-  if (terminal.isTTY && !options.apply) {
+  if (!headless) {
+    await maybeGenerateDebateImage(options, topic, synthesis);
+  }
+
+  if (terminal.isTTY && !options.apply && !headless) {
     await offerFollowUp(
       client,
       synthesis,
@@ -760,6 +1216,47 @@ export async function debateCommand(
       wsContext,
       options,
     );
+  }
+}
+
+function parseSynthesisForSchema(synthesis: string): unknown {
+  const trimmed = synthesis.trim();
+  if (!trimmed) return {};
+  const fence = trimmed.match(/```(?:json)?\s*\n([\s\S]*?)\n```/i);
+  const candidate = fence?.[1]?.trim() ?? trimmed;
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    return { synthesis };
+  }
+}
+
+function extractPlanSteps(synthesis: string): void {
+  if (!synthesis) return;
+  if (getPlan().length > 0) return;
+  const lines = synthesis.split(/\r?\n/);
+  for (const raw of lines) {
+    const line = raw.trim();
+    const match = line.match(/^(?:[-*+]|\d+[.)])\s+(.*\S)/);
+    if (match && match[1]) {
+      recordPlanStep(match[1]);
+    }
+  }
+}
+
+async function promptRefinement(): Promise<string> {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+  try {
+    return await new Promise<string>((resolve) => {
+      rl.question(st.dim("Refinement (blank to cancel): "), (raw) =>
+        resolve(raw.trim()),
+      );
+    });
+  } finally {
+    rl.close();
   }
 }
 
@@ -816,6 +1313,11 @@ async function offerFollowUp(
   }
 }
 
+interface DeliberationFlowExtras {
+  headlessFormat?: HeadlessOutputFormat;
+  budgetGuard?: BudgetGuard;
+}
+
 async function runDeliberation(
   client: ConsiliumClient,
   topic: string,
@@ -824,10 +1326,18 @@ async function runDeliberation(
   outputFormat: OutputFormat,
   useLiveProgress: boolean,
   wsContext?: WorkspaceDebateContext | null,
+  extras?: DeliberationFlowExtras,
 ): Promise<string> {
   const startTime = Date.now();
+  const headlessFormat = extras?.headlessFormat ?? "text";
+  const headless = isHeadlessFormat(headlessFormat);
+  const streamJson = headlessFormat === "stream-json";
+  const budgetGuard = extras?.budgetGuard;
+  const liveProgress = useLiveProgress && !headless;
 
-  console.log(st.brand(`\n  Deliberation mode: ${mode}\n`));
+  if (!headless) {
+    console.log(st.brand(`\n  Deliberation mode: ${mode}\n`));
+  }
 
   let deliberation: { id: string };
   try {
@@ -854,7 +1364,17 @@ async function runDeliberation(
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : "Create failed";
     log("ERROR", "deliberation_failed", { error: msg });
-    console.log(st.error("Deliberation creation failed: " + msg));
+    if (headless) {
+      emitFinalJson({
+        ok: false,
+        error: "Deliberation creation failed: " + msg,
+        topic,
+        mode,
+        models,
+      });
+    } else {
+      console.log(st.error("Deliberation creation failed: " + msg));
+    }
     process.exit(1);
   }
 
@@ -865,7 +1385,7 @@ async function runDeliberation(
 
   const ctx: DeliberationStreamCtx = {
     deliberationId: deliberation.id,
-    useLiveProgress,
+    useLiveProgress: liveProgress,
     currentPhase: "",
     modelProgress: new Map<string, number>(),
     convergence: null,
@@ -875,24 +1395,77 @@ async function runDeliberation(
     resultText: "",
   };
 
+  let aborted = false;
+  let abortReason: string | undefined;
+
+  async function maybeAbort(): Promise<void> {
+    if (!budgetGuard || aborted) return;
+    const decision = budgetGuard.shouldAbort();
+    if (!decision.abort) return;
+    aborted = true;
+    abortReason = decision.reason;
+  }
+
   try {
     await client.streamDeliberation(
       deliberation.id,
       (event: DeliberationEvent) => {
-        processDeliberationEvent(event, ctx);
+        if (event.type === "cost_update" && event.cost) {
+          budgetGuard?.recordTurnCost(event.cost.cost);
+        }
+        if (event.type === "phase_change") {
+          budgetGuard?.recordTurn();
+        }
+        if (headless) {
+          if (event.type === "deliberation_complete" && event.text) {
+            ctx.resultText = event.text;
+          }
+          if (event.type === "cost_update" && event.cost) {
+            ctx.costs.push(event.cost);
+          }
+          if (event.type === "dissent_detected" && event.dissent) {
+            ctx.dissents.push(event.dissent);
+          }
+          if (event.type === "vote_cast" && event.vote) {
+            ctx.votes.push(event.vote);
+          }
+          if (streamJson) {
+            emitStreamEvent({
+              type: event.type,
+              data: event,
+              ts: Date.now(),
+            });
+          }
+        } else {
+          processDeliberationEvent(event, ctx);
+        }
+        void maybeAbort();
       },
     );
   } catch (error: unknown) {
-    if (useLiveProgress) logUpdate.clear();
+    if (liveProgress) logUpdate.clear();
     const msg = error instanceof Error ? error.message : "Unknown error";
-    log("ERROR", "deliberation_failed", {
-      debateId: deliberation.id,
-      error: msg,
-      durationMs: Date.now() - startTime,
-    });
-    console.log(st.error("\n  Error: " + msg + "\n"));
-    logStreamFailureHints(error);
-    process.exit(1);
+    if (!aborted) {
+      log("ERROR", "deliberation_failed", {
+        debateId: deliberation.id,
+        error: msg,
+        durationMs: Date.now() - startTime,
+      });
+      if (headless) {
+        emitFinalJson({
+          ok: false,
+          error: msg,
+          topic,
+          mode,
+          models,
+          debateId: deliberation.id,
+        });
+      } else {
+        console.log(st.error("\n  Error: " + msg + "\n"));
+        logStreamFailureHints(error);
+      }
+      process.exit(1);
+    }
   }
 
   log("INFO", "deliberation_completed", {
@@ -901,6 +1474,31 @@ async function runDeliberation(
   });
 
   writeDebateMemory(wsContext, topic, mode, ctx.resultText, deliberation.id);
+
+  if (headless) {
+    const payload: Record<string, unknown> = {
+      ok: !aborted,
+      synthesis: ctx.resultText,
+      debateId: deliberation.id,
+      topic,
+      mode,
+      models,
+      dissents: ctx.dissents,
+      votes: ctx.votes,
+      costs: ctx.costs,
+      budget: budgetGuard?.summary(),
+    };
+    if (aborted) {
+      payload["aborted"] = true;
+      payload["abortReason"] = abortReason;
+    }
+    if (streamJson) {
+      emitStreamEvent({ type: "complete", data: payload, ts: Date.now() });
+    } else {
+      emitFinalJson(payload);
+    }
+    return ctx.resultText;
+  }
 
   if (ctx.dissents.length > 0) {
     console.log(st.warning("\n  Dissent report:"));
@@ -935,7 +1533,13 @@ async function runDeliberation(
     deliberation.id,
   );
 
-  console.log(st.success("\nDeliberation complete.\n"));
+  if (aborted) {
+    console.log(
+      st.warning(`Deliberation aborted: ${abortReason ?? "limit reached"}`),
+    );
+  } else {
+    console.log(st.success("\nDeliberation complete.\n"));
+  }
   return ctx.resultText;
 }
 

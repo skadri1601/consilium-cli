@@ -1,4 +1,5 @@
 import { loadConfig, saveConfig } from "./config";
+import { resolveApiKey } from "./api-key-helper";
 
 export type Provider =
   | "openai"
@@ -98,6 +99,26 @@ export class KeyManager {
     if (envValue) return envValue;
     const keys = this.loadProviderKeys();
     return keys[provider];
+  }
+
+  async getKeyAsync(provider: Provider): Promise<string | undefined> {
+    const fromHelper = await resolveApiKey(provider);
+    if (fromHelper) return fromHelper;
+    return this.getKey(provider);
+  }
+
+  async resolveKeysForModelsAsync(
+    models: string[],
+  ): Promise<Map<string, string | undefined>> {
+    const result = new Map<string, string | undefined>();
+    for (const model of models) {
+      const provider = MODEL_PROVIDER_MAP[model];
+      result.set(
+        model,
+        provider ? await this.getKeyAsync(provider) : undefined,
+      );
+    }
+    return result;
   }
 
   setKey(provider: Provider, key: string): void {

@@ -12,6 +12,11 @@ import {
   formatCostEstimate,
 } from "./debate-modes";
 import { OutputFormat, isValidOutputFormat } from "./output-formatter";
+import {
+  renderContextGrid,
+  renderContextSummary,
+  type TokenUsage,
+} from "./context-grid";
 
 const s = style();
 const w = terminal.width;
@@ -96,6 +101,33 @@ function logContextTokenBudget(
   );
 }
 
+function buildSessionTokenUsage(session: ChatSession): TokenUsage {
+  const cm = session.contextManager;
+  const totalFileSize = cm.getTotalSize();
+  const systemTokens = 2000;
+  const userChars = session.debates.reduce(
+    (sum, d) => sum + (d.topic?.length ?? 0),
+    0,
+  );
+  const assistantChars = session.debates.reduce(
+    (sum, d) => sum + (d.goldenPrompt?.length ?? 0),
+    0,
+  );
+  const userTokens = Math.ceil((userChars + totalFileSize) / 4);
+  const assistantTokens = Math.ceil(assistantChars / 4);
+  const used = systemTokens + userTokens + assistantTokens;
+  return {
+    used,
+    limit: 200_000,
+    segments: [
+      { label: "system", tokens: systemTokens, color: "system" },
+      { label: "user", tokens: userTokens, color: "user" },
+      { label: "assistant", tokens: assistantTokens, color: "assistant" },
+      { label: "tool", tokens: 0, color: "tool" },
+    ],
+  };
+}
+
 export function handleContextCommand(session: ChatSession): void {
   const cm = session.contextManager;
   const files = cm.getFiles();
@@ -118,6 +150,13 @@ export function handleContextCommand(session: ChatSession): void {
   );
   logContextTokenBudget(totalFileSize, followUpChars);
   console.log(borderBottom(w));
+
+  const usage = buildSessionTokenUsage(session);
+  console.log("");
+  console.log(s.dim(renderContextSummary(usage)));
+  console.log("");
+  console.log(renderContextGrid(usage));
+  console.log("");
 }
 
 export function handleModeCommand(

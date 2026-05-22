@@ -1,0 +1,297 @@
+.TH CONSILIUM 1 "May 2026" "Consilium CLI" "User Commands"
+.SH NAME
+consilium \- multi-agent AI debate platform CLI
+.SH SYNOPSIS
+.B consilium
+[\fIcommand\fR]
+[\fIoptions\fR]
+[\fIarguments\fR]
+.PP
+.B consilium
+\fIquestion\fR
+.SH DESCRIPTION
+.B consilium
+is the command-line interface for the Consilium multi-agent debate platform.
+It orchestrates structured deliberation between multiple large language models
+across eight research-backed modes (quick, council, deep, blind, redteam,
+jury, market, auto). Models argue, critique, and synthesize consensus through
+independent analysis, cross-examination, rebuttal, and judge phases.
+.PP
+With no arguments,
+.B consilium
+launches an interactive menu (when logged in) or a login flow. With a single
+non-flag argument it is treated as a one-shot debate topic.
+.SH COMMANDS
+.TP
+.B debate \fItopic\fR
+Start a multi-agent debate on a topic. The primary entry point: streams a
+deliberation between selected models and prints a synthesized answer.
+.TP
+.B ask \fItopic\fR
+Alias of
+.BR debate ,
+suitable for one-off questions.
+.TP
+.B chat
+Start an interactive chat session with multi-agent debates. Supports slash
+commands, session save/resume, and follow-up turns.
+.TP
+.B sessions \fIsubcommand\fR
+Manage saved chat sessions. Subcommands:
+.BR list ,
+.BR resume ,
+.BR rename ,
+.BR delete .
+.TP
+.B config \fIsubcommand\fR
+Manage CLI configuration stored in
+.IR ~/.consilium/config.json .
+Subcommands:
+.BR set ,
+.BR get ,
+.BR list .
+.TP
+.B login
+Sign in and obtain a CLI token. Opens the web app for authentication.
+.TP
+.B logout
+Sign out and clear stored credentials.
+.TP
+.B setup-token
+Generate a long-lived CI/CD token (default 365 days). Use
+.B --print
+for script-friendly output.
+.TP
+.B share \fIsessionId\fR
+Share a saved session via the backend (falls back to a local JSON export).
+Pass
+.B --public
+to make it publicly readable.
+.TP
+.B voice
+Record audio, transcribe with Whisper, and optionally pipe the transcript
+into a debate.
+.TP
+.B models
+Show defaults, the full model catalog, and deprecation status.
+.TP
+.B mcp \fIsubcommand\fR
+Manage MCP (Model Context Protocol) server integrations. Subcommands:
+.BR setup ,
+.BR add ,
+.BR list ,
+.BR remove ,
+.BR test ,
+.BR tools .
+.TP
+.B benchmark
+Run deliberation benchmarks (MMLU, TruthfulQA, HumanEval).
+.TP
+.B eval
+Run a blind evaluation of responses from multiple models.
+.TP
+.B redteam \fIcontent\fR
+Run an adversarial red-team assessment against
+.IR content .
+.TP
+.B logs \fIdebateId\fR
+Query logs for a debate. Filter by level with
+.BR --level .
+.TP
+.B stats
+Show a model performance dashboard.
+.TP
+.B debug \fIdebateId\fR
+Print the full debug trace for a debate.
+.TP
+.B upgrade
+Update the Consilium CLI to the latest published version. Auto-detects
+pnpm, npm, yarn, or bun.
+.TP
+.B completions \fIshell\fR
+Print the shell completion script for
+.IR bash ,
+.IR zsh ,
+or
+.I fish
+to stdout. See
+.B INSTALLING COMPLETIONS
+below.
+.SH OPTIONS
+Most options are scoped to a single subcommand. The flags below appear most
+often on
+.B debate
+and
+.BR ask .
+.SS Mode and models
+.TP
+.BR -m ", " --models " " \fIid...\fR
+Models to use (e.g.
+.IR claude-haiku-4-5-20251001 " " gpt-5.4-mini ).
+.TP
+.B --mode \fImode\fR
+Debate mode:
+.IR quick ", " council ", " deep ", " blind ", " redteam ", " jury ", " market ", " auto .
+Defaults to
+.IR auto .
+.SS Output and formatting
+.TP
+.B --output \fIformat\fR
+Output format:
+.IR markdown ", " cursorrules ", " claude-md ", " json .
+Defaults to a pretty-printed terminal view.
+.TP
+.B --output-format \fIfmt\fR
+One of
+.IR text ", " json ", " stream-json .
+.TP
+.B --json-schema \fIpath\fR
+Validate the final synthesis against the given JSON Schema file and emit
+JSON.
+.SS Context
+.TP
+.B --file \fIpaths...\fR
+Files to attach as context for the council.
+.TP
+.B --ticket \fIid\fR
+Linear ticket ID (e.g.
+.IR MYC-123 )
+to attach as context.
+.TP
+.B --no-git
+Do not auto-attach git diff/branch/recent commits.
+.TP
+.B --no-context
+Disable automatic codebase context loading.
+.TP
+.B --no-tools
+Do not expose Read/Edit/Grep/Bash tools to the council.
+.SS Budget and runtime
+.TP
+.B --max-budget-usd \fIn\fR
+Abort if the running cost estimate exceeds this many USD.
+.TP
+.B --max-turns \fIn\fR
+Cap the debate at
+.I N
+rounds, overriding the mode default.
+.TP
+.BR -b ", " --bg
+Run the debate as a detached background agent.
+.TP
+.B --plan
+Plan mode: emit a written plan for approval before any write.
+.TP
+.B --apply
+Apply structured edits from the synthesis directly to files.
+.SS Image generation
+.TP
+.B --generate-image
+Generate an image from the debate synthesis using the agents image-gen tool.
+.TP
+.B --image-prompt-from \fIsrc\fR
+.IR synthesis " (default) or " topic .
+.TP
+.B --image-size \fIsize\fR
+Image dimensions, e.g.
+.IR 1024x1024 .
+.SH FILES
+.TP
+.I ~/.consilium/config.json
+Stored API URL, token, and user preferences.
+.TP
+.I ~/.consilium/sessions/
+Saved chat sessions, each as a JSON file.
+.TP
+.I .consilium-session-<id>.json
+Local fallback export written by
+.B share
+when the backend share endpoint is unavailable.
+.SH ENVIRONMENT
+.TP
+.B CONSILIUM_API_URL
+Override the default API origin
+.RI ( https://api.myconsilium.xyz ).
+.TP
+.B CONSILIUM_DEBUG
+When set, emits verbose CLI tracing (request URLs, retries, SSE events).
+.SH INSTALLING COMPLETIONS
+.SS bash
+.nf
+eval "$(consilium completions bash)"
+.fi
+Add the line above to
+.I ~/.bashrc
+to persist across shells.
+.SS zsh
+.nf
+consilium completions zsh > "${fpath[1]}/_consilium"
+.fi
+Reload shell or run
+.B compinit
+afterwards.
+.SS fish
+.nf
+consilium completions fish > ~/.config/fish/completions/consilium.fish
+.fi
+.SH EXAMPLES
+Start a quick debate on a topic:
+.PP
+.RS
+.B consilium debate "Should we use Postgres or DynamoDB?" --mode quick
+.RE
+.PP
+Run a council mode debate with specific models and a budget cap:
+.PP
+.RS
+.B consilium debate "Refactor auth module" \\\\
+.br
+.B "  --mode council --max-budget-usd 1.00 \\\\"
+.br
+.B "  -m claude-haiku-4-5-20251001 gpt-5.4-mini"
+.RE
+.PP
+Attach files and a Linear ticket as context:
+.PP
+.RS
+.B consilium debate "Review this change" \\\\
+.br
+.B "  --file src/auth.ts --ticket MYC-123"
+.RE
+.PP
+Print a JSON-structured synthesis validated against a schema:
+.PP
+.RS
+.B consilium debate "Generate API spec" \\\\
+.br
+.B "  --output-format json --json-schema ./schema.json"
+.RE
+.PP
+Resume a saved chat session:
+.PP
+.RS
+.B consilium sessions resume ses_01HY3K...
+.RE
+.PP
+Generate a long-lived CI token for GitHub Actions:
+.PP
+.RS
+.B consilium setup-token --name github-actions --days 365 --print
+.RE
+.SH SEE ALSO
+.BR git (1),
+.BR jq (1)
+.PP
+Documentation:
+.UR https://myconsilium.xyz
+.UE
+.PP
+Source:
+.UR https://github.com/skadri1601/Consilium
+.UE
+.SH BUGS
+Report issues at
+.UR https://github.com/skadri1601/Consilium/issues
+.UE
+.SH AUTHOR
+Saad Kadri and contributors.

@@ -1,4 +1,4 @@
-import EventSource from "eventsource";
+import { EventSource } from "eventsource";
 import { DEFAULT_API_ORIGIN, loadConfig } from "../utils/config";
 
 export interface ToolSchema {
@@ -41,6 +41,7 @@ export interface DebateOptions {
   debateSource?: "web" | "cli" | "mcp";
   tools?: ToolSchema[];
   toolBudget?: ToolBudget;
+  reasoningEffort?: "low" | "medium" | "high" | "xhigh" | "max";
 }
 
 export interface DeliberationOptions {
@@ -268,11 +269,18 @@ export class ConsiliumClient {
     const apiKey = this.getApiKey();
     const buildInit = (
       lastEventId: string | null,
-    ): { headers?: Record<string, string> } => {
+    ): ConstructorParameters<typeof EventSource>[1] => {
       const headers: Record<string, string> = {};
       if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
       if (lastEventId) headers["Last-Event-ID"] = lastEventId;
-      return Object.keys(headers).length ? { headers } : {};
+      if (!Object.keys(headers).length) return undefined;
+      return {
+        fetch: (url, init) =>
+          fetch(url, {
+            ...init,
+            headers: { ...init.headers, ...headers },
+          }),
+      };
     };
 
     let attempt = 0;
@@ -417,6 +425,8 @@ export class ConsiliumClient {
       if (Object.keys(pc).length > 0) body.projectContext = pc;
       if (options.tools?.length) body.tools = options.tools;
       if (options.toolBudget) body.toolBudget = options.toolBudget;
+      if (options.reasoningEffort)
+        body.reasoningEffort = options.reasoningEffort;
 
       if (process.env.CONSILIUM_DEBUG) {
         const fileNames = pc.files?.map((f: any) => f.name) || [];
