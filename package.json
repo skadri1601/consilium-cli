@@ -14,6 +14,7 @@
     "test:coverage": "vitest run --coverage",
     "test:watch": "vitest",
     "test:e2e": "vitest run --config e2e/vitest.config.ts",
+    "type-check": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run build"
   },
@@ -53,14 +54,13 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@types/eventsource": "^3.0.0",
-    "@types/node": "^25.6.0",
-    "@vitest/coverage-v8": "4.1.5",
+    "@types/node": "^25.9.1",
+    "@vitest/coverage-v8": "4.1.7",
     "tsup": "^8.5.1",
-    "tsx": "^4.21.0",
-    "typescript": "^5.9.3",
-    "vite": "^7.1.12",
-    "vitest": "^4.1.5"
+    "tsx": "^4.22.3",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.14",
+    "vitest": "^4.1.7"
   },
   "files": [
     "dist",

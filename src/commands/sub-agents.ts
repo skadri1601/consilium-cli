@@ -4,7 +4,9 @@ import {
   loadUserSubAgents,
   getUserSubAgentsDir,
 } from "../sub-agents/loader";
-import { style as st } from "../utils/visual-system";
+import { style } from "../utils/visual-system";
+
+const st = style();
 
 export async function subAgentsListCommand(): Promise<void> {
   const agents = await loadUserSubAgents();
