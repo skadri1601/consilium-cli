@@ -86,6 +86,11 @@ export function setMode(mode: PermissionMode): void {
       `Invalid permission mode: ${mode}. Valid: ${MODE_ORDER.join(", ")}.`,
     );
   }
+  if (mode === "bypass" && !isBypassAllowed()) {
+    throw new Error(
+      "Cannot set bypass mode: CONSILIUM_ALLOW_BYPASS=1 is required.",
+    );
+  }
   process.env[ENV_KEY] = mode;
   persistMode(mode);
 }

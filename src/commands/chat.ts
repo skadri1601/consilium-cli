@@ -43,6 +43,7 @@ import { getTUI } from "../utils/tui-renderer";
 import { safeRunHooks, shouldBlock } from "../hooks/runner";
 import { renderStatusLine, getCurrentContext } from "../utils/status-line";
 import { loadMemory } from "../utils/auto-memory";
+import { isPathTrusted } from "../utils/workspace-trust";
 
 const DEFAULT_SESSION_DIR = path.join(
   process.env.HOME || process.env.USERPROFILE || "",
@@ -415,6 +416,14 @@ async function runShellPassthrough(command: string): Promise<void> {
   if (isDangerousShellCommand(command)) {
     console.log(
       theme.error("[SHELL MODE] Blocked dangerous command: " + command),
+    );
+    return;
+  }
+  if (!isPathTrusted(process.cwd())) {
+    console.log(
+      theme.warning(
+        "[SHELL MODE] Workspace is not trusted. Trust this workspace first with /permissions.",
+      ),
     );
     return;
   }

@@ -260,6 +260,26 @@ export interface ExtractedInsight {
   insight: string;
 }
 
+const MAX_EXTRACTED_LENGTH = 200;
+const CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
+const INJECTION_PATTERNS = [
+  /ignore\s+(?:all\s+)?previous/i,
+  /\bsystem\s*:/i,
+  /\boverride\s+instructions/i,
+  /\byou\s+are\s+now\b/i,
+  /\bforget\s+(?:all|everything|your)\b/i,
+];
+
+function sanitizeExtracted(raw: string): string | null {
+  let cleaned = raw.trim().replace(/\s+/g, " ").replace(CONTROL_CHAR_RE, "");
+  cleaned = cleaned.slice(0, MAX_EXTRACTED_LENGTH);
+  if (cleaned.length < 4) return null;
+  for (const pattern of INJECTION_PATTERNS) {
+    if (pattern.test(cleaned)) return null;
+  }
+  return cleaned;
+}
+
 export function extractInsightFromSynthesis(
   synthesis: string,
 ): ExtractedInsight | null {
@@ -268,8 +288,8 @@ export function extractInsightFromSynthesis(
   for (const { kind, regex } of EXTRACTOR_PATTERNS) {
     const match = regex.exec(text);
     if (match && match[1]) {
-      const insight = match[1].trim().replace(/\s+/g, " ");
-      if (insight.length >= 4) {
+      const insight = sanitizeExtracted(match[1]);
+      if (insight) {
         return { kind, insight };
       }
     }

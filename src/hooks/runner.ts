@@ -1,4 +1,4 @@
-import { exec } from "node:child_process";
+import { execFile } from "node:child_process";
 import {
   type CommandHookEntry,
   type HookConfig,
@@ -37,15 +37,44 @@ function matcherMatches(
   return true;
 }
 
+function parseCommand(command: string): { bin: string; args: string[] } {
+  const parts: string[] = [];
+  let current = "";
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!;
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+    } else if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+    } else if ((ch === " " || ch === "\t") && !inSingle && !inDouble) {
+      if (current.length > 0) {
+        parts.push(current);
+        current = "";
+      }
+    } else {
+      current += ch;
+    }
+  }
+  if (current.length > 0) parts.push(current);
+  return { bin: parts[0] ?? "", args: parts.slice(1) };
+}
+
 function runCommandHook(
   entry: CommandHookEntry,
   payload: Record<string, unknown>,
   defaultTimeoutMs: number,
 ): Promise<HookResult> {
   const timeout = entry.timeoutMs ?? defaultTimeoutMs;
+  const { bin, args } = parseCommand(entry.command);
+  if (!bin) {
+    return Promise.resolve({ ok: false, error: "Empty hook command" });
+  }
   return new Promise<HookResult>((resolve) => {
-    const child = exec(
-      entry.command,
+    const child = execFile(
+      bin,
+      args,
       { timeout, windowsHide: true, maxBuffer: 1024 * 1024 },
       (error, stdout, stderr) => {
         const out = stdout?.toString().trim();

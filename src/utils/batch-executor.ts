@@ -29,6 +29,7 @@ export interface BatchOptions {
   timeoutMs?: number;
   openPRs?: boolean;
   cwd?: string;
+  budgetPerWorker?: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 600_000;
@@ -50,6 +51,7 @@ function buildDebateArgs(
   topic: string,
   mode: string,
   models: string[] | undefined,
+  budgetPerWorker: number,
 ): string[] {
   const args = [
     "debate",
@@ -59,7 +61,7 @@ function buildDebateArgs(
     "--output-format",
     "json",
     "--max-budget-usd",
-    "1.0",
+    budgetPerWorker.toFixed(2),
   ];
   if (models && models.length > 0) {
     args.push("--models", models.join(","));
@@ -156,10 +158,11 @@ async function runOneTask(
   const started = Date.now();
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const mode = opts.mode ?? "council";
+  const budgetPerWorker = opts.budgetPerWorker ?? 1.0;
   const { command, prefixArgs } = resolveBinary();
   const args = [
     ...prefixArgs,
-    ...buildDebateArgs(task.topic, mode, opts.models),
+    ...buildDebateArgs(task.topic, mode, opts.models, budgetPerWorker),
   ];
 
   return await new Promise<BatchResult>((resolve) => {
@@ -264,6 +267,12 @@ export async function runBatch(opts: BatchOptions): Promise<BatchResult[]> {
   if (!topic) {
     throw new Error("Batch topic is required");
   }
+
+  const budgetPerWorker = opts.budgetPerWorker ?? 1.0;
+  const totalBudget = opts.count * budgetPerWorker;
+  console.log(
+    `[batch] ${opts.count} worker(s) × $${budgetPerWorker.toFixed(2)}/worker = $${totalBudget.toFixed(2)} max total budget`,
+  );
 
   const cwd = opts.cwd ?? process.cwd();
   const tasks: BatchTask[] = [];
