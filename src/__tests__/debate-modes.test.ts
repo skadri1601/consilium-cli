@@ -6,6 +6,7 @@ import {
   getDefaultMode,
   estimateCost,
   formatCostEstimate,
+  type DebateModeConfig,
 } from "../utils/debate-modes";
 
 describe("isValidMode", () => {
@@ -102,7 +103,7 @@ describe("formatCostEstimate", () => {
 
 describe("DEBATE_MODES config", () => {
   it("each mode has required fields", () => {
-    for (const [, cfg] of Object.entries(DEBATE_MODES)) {
+    for (const cfg of Object.values(DEBATE_MODES) as DebateModeConfig[]) {
       expect(cfg.rounds).toBeGreaterThanOrEqual(1);
       expect(typeof cfg.subAgents).toBe("boolean");
       expect(cfg.estimatedCost).toBeGreaterThan(0);

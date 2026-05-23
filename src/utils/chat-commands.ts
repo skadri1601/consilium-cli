@@ -10,6 +10,7 @@ import {
   isValidMode,
   estimateCost,
   formatCostEstimate,
+  type DebateModeConfig,
 } from "./debate-modes";
 import { OutputFormat, isValidOutputFormat } from "./output-formatter";
 import {
@@ -178,7 +179,7 @@ export function handleModeCommand(
     }
     console.log(contentLine("", w));
     console.log(contentLine("Available modes:", w));
-    for (const [name, cfg] of Object.entries(DEBATE_MODES)) {
+    for (const [name, cfg] of Object.entries(DEBATE_MODES) as [string, DebateModeConfig][]) {
       const marker = name === currentMode ? s.brand("*") : " ";
       console.log(
         contentLine(`  ${marker} ${name.padEnd(10)} ${cfg.description}`, w),
